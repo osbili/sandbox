@@ -6,3 +6,5 @@ mean(x)
 mad(x)
 
 summary(x)
+
+#HI CAN!
