@@ -1,0 +1,548 @@
+---
+title: "Bayesian GLM Part5"
+author: "Murray Logan"
+date: today
+date-format: "DD/MM/YYYY"
+format: 
+  html:
+    ## Format
+    theme: [default, ../resources/ws-style.scss]
+    css: ../resources/ws_style.css
+    html-math-method: mathjax
+    ## Table of contents
+    toc: true
+    toc-float: true
+    ## Numbering
+    number-sections: true
+    number-depth: 3
+    ## Layout
+    page-layout: full
+    fig-caption-location: "bottom"
+    fig-align: "center"
+    fig-width: 4
+    fig-height: 4
+    fig-dpi: 72
+    tbl-cap-location: top
+    ## Code
+    code-fold: false
+    code-tools: true
+    code-summary: "Show the code"
+    code-line-numbers: true
+    code-block-border-left: "#ccc"
+    code-copy: true
+    highlight-style: atom-one
+    ## Execution
+    execute:
+      echo: true
+      cache: true
+    ## Rendering
+    embed-resources: true
+crossref:
+  fig-title: '**Figure**'
+  fig-labels: arabic
+  tbl-title: '**Table**'
+  tbl-labels: arabic
+engine: knitr
+output_dir: "docs"
+documentclass: article
+fontsize: 12pt
+mainfont: Arial
+mathfont: LiberationMono
+monofont: DejaVu Sans Mono
+classoption: a4paper
+bibliography: ../resources/references.bib
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+knitr::opts_chunk$set(cache.lazy = FALSE,
+                      tidy = "styler")
+options(tinytex.engine = "xelatex")
+```
+
+# Preparations
+
+Load the necessary libraries
+
+
+```{r}
+#| label: libraries
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false
+
+library(tidyverse)     #for data wrangling etc
+library(rstanarm)      #for fitting models in STAN
+library(cmdstanr)      #for cmdstan
+library(brms)          #for fitting models in STAN
+library(coda)          #for diagnostics
+library(bayesplot)     #for diagnostics
+#library(ggmcmc)        #for MCMC diagnostics
+library(DHARMa)        #for residual diagnostics
+library(rstan)         #for interfacing with STAN
+library(emmeans)       #for marginal means etc
+library(broom)         #for tidying outputs
+library(tidybayes)     #for more tidying outputs
+library(ggeffects)     #for partial plots
+library(broom.mixed)   #for summarising models
+library(ggeffects)     #for partial effects plots
+library(bayestestR)    #for ROPE
+library(see)           #for some plots
+library(easystats)     #for the easystats ecosystem
+library(ggridges)      #for ridge plots
+library(patchwork)     #for multiple plots
+library(modelsummary)  #for data and model summaries 
+theme_set(theme_grey()) #put the default ggplot theme back
+source("helperFunctions.R")
+```
+
+# Scenario
+
+Here is a modified example from @Quinn-2002-2002. Day and Quinn
+(1989) described an experiment that examined how rock surface type
+affected the recruitment of barnacles to a rocky shore. The experiment
+had a single factor, surface type, with 4 treatments or levels: algal
+species 1 (ALG1), algal species 2 (ALG2), naturally bare surfaces (NB)
+and artificially scraped bare surfaces (S). There were 5 replicate plots
+for each surface type and the response (dependent) variable was the
+number of newly recruited barnacles on each plot after 4 weeks.
+
+![Six-plated barnacle](../resources/barnacles.jpg){#fig-barnacle width="224" height="308"}
+
+:::: {.columns}
+
+::: {.column width="50%"}
+
+TREAT   BARNACLE
+------- ----------
+ALG1    27
+..      ..
+ALG2    24
+..      ..
+NB      9
+..      ..
+S       12
+..      ..
+
+: Format of day.csv data files {#tbl-day .table-condensed}
+
+```{r}
+# We might wanna know --> comparison of substrates for recruitment
+
+## Is recruitment affected by substrate?
+
+```
+
+
+:::
+
+::: {.column width="50%"}
+
+-------------- ----------------------------------------------------------------------------------------------------------------------------------------------
+**TREAT**      Categorical listing of surface types. ALG1 = algal species 1, ALG2 = algal species 2, NB = naturally bare surface, S = scraped bare surface.
+**BARNACLE**   The number of newly recruited barnacles on each plot after 4 weeks.
+-------------- ----------------------------------------------------------------------------------------------------------------------------------------------
+
+: Description of the variables in the day data file {#tbl-day1 .table-condensed}
+
+:::
+::::
+
+# Read in the data
+
+```{r}
+#| label: readData
+
+day <- read_csv('../data/day.csv', trim_ws = TRUE)
+```
+```{r}
+head(day)
+```
+
+```{r}
+str(day)
+```
+
+```{r}
+summarise(day)
+```
+
+```{r}
+# Observed values which are count data -> We will incorporate Poisson (lambda), Poisson is scaled by log. but the treatments are not enough to explain effects when you do log transform. so you use treatment effects model where first group becames the reference group and others become the explanation for the treatments and they are compared to the reference. R does the things in alphabetical order so ALG1 will be our reference group. It is fine but we can also change it if we want. Never allow your reference one deduced from the the group with least amount of data because it can make the reference unreliable. You can also not make the first measurement group as your first group therefore a reference group because the sampling is not familiared with or we can say practice makes perfect.
+
+#log(lambdai) = b0 + b1D1 + b2D2 + b3D3 + b4D4
+
+#b0 => µA1 -> becomes reference for others so 
+#b1 => µA2 - µA1
+#b2 => µNB - µA1
+#b3 +> µS - µA1
+
+# We are gonna calculate the mean for AGL1 to give a vague estimate of a prior.
+#b0~N( , )
+
+#b1,2,3~N(0, ) -> We dont want to dictate the model to move which direction, so we put 0 to the mean to priors not determine.
+
+# Normally we would have a prior for sigma but for Poisson we assume the sigma is equal to lambda because Poissons assumption is no change in variance there for same as lambda.
+
+# You can have the groups ordered and it will be called polynomial model.
+# Cell means model -> telling you the means of your group -> it does not make change in ANOVA.
+
+# We assume the dispersion is equal to 1 meaning each mean has its own variance, small recruits will have small mean therefore small variance.
+
+#If we keep intercept,  Treatment effects model
+
+```
+
+```{r}
+#| label: examineData
+glimpse(day)
+```
+
+```{r}
+library(knitr)
+fert |> datawizard::data_codebook() |> knitr::kable()
+```
+
+
+```{r}
+#|label: Check for data
+day |> 
+ggplot(aes(x = TREAT, y = BARNACLE)) +
+  geom_boxplot() +
+  geom_point(colour="red")
+```
+
+
+Start by declaring the categorical variables as factor.
+
+```{r}
+#We need to make sure we are working with categorical data, We are going to mutate the categories to factor. Otherwise when we further down with statistics some categories being characters might become a problem.
+
+day <- day |>  mutate(TREAT = factor(TREAT))
+
+#We change the order of the data so the first one (NB chosen) is changed to set a different reference point.
+day <- day |>  mutate(TREAT = factor(TREAT, levels = c("NB", "ALG1", "ALG2", "S")))
+
+#We check if the order changed in the boxplot
+day |> 
+ggplot(aes(x = TREAT, y = BARNACLE)) +
+  geom_boxplot() +
+  geom_point(colour="red")
+
+day$TREAT
+model.matrix(~0 + TREAT, data = day)
+```
+
+# Model formula:
+
+```{r}
+# All priors must be on the scale of the link function, for Poisson it is log
+
+#Without log link
+day |> 
+  group_by(TREAT) |> 
+  summarise(Median = median(BARNACLE),
+  MAD = mad(BARNACLE))
+
+#With log link
+day |> 
+  group_by(TREAT) |> 
+  summarise(Median = median(log(BARNACLE)),
+  MAD = mad(log(BARNACLE)))
+
+#Mean of the first group is our intercept, so mean (mean defines middle of the observation, as a location, which might be a median) of NB.
+# For variance, we eyeball the variance, again with priors we dont need to be precise.
+
+# So our formula for 
+# b0 ~ N(2.6,0.3) => mean approximately 2.6, variance is approximately 0.3 for NB!!
+# b1,2,3~N( , ) is => b1,2,3~N(0,1) for rest!!
+```
+
+$$
+\begin{align}
+y_i &\sim{} \mathcal{Pois}(\lambda_i)\\
+ln(\mu_i) &= \boldsymbol{\beta} \bf{X_i}\\
+\beta_0 &\sim{} \mathcal{N}(3.1, 1)\\
+\beta_{1,2,3} &\sim{} \mathcal{N}(0,1)\\
+\end{align}
+$$
+
+# Exploratory data analysis
+```{r}
+# Now we are modelling our formula. 
+
+day.form <- bf(BARNACLE ~ TREAT, family = poisson(link = 'log'))
+
+# Now we are gonna input our priors
+
+priors <- prior(normal(2.6,0.3), class = 'Intercept') +
+  prior(normal(0, 1), class = 'b')
+day.brm2 <- brm(day.form,
+        data = day,
+        prior = priors,
+        sample_prior = 'only',
+        iter = 5000,
+        warmup = 1000,
+        chains = 3, cores = 3,
+        thin = 5,
+        refresh = 0,
+        seed = 1,
+        backend = "cmdstanr")
+```
+
+# Fit the model
+
+```{r}
+#|label: Checking influence of priors and the actual data
+day.brm2 |> ggpredict() |> plot(show_data = TRUE)
+
+# the priors ( dotted line) covers the data, which is what we want. The prediction made by priors should cover the data but also shouldnt be too wide. In this case, the priors cover all of the data, and some more which is what we want.
+
+day.brm2 |>  ggemmeans(~TREAT) |> plot(show_data = TRUE)
+
+#emmeans is better way to observe
+```
+
+```{r}
+#| label: Visually checking the priors and actuall data, and the distribution.
+#CI represent how varied means are going to be
+
+#This is the prediction intervals -> you want all possible calculated means to range within the prediction intervals.
+day.brm2 |> conditional_effects() |>  plot(points = TRUE)
+day.brm3 <- day.brm2 |> 
+  update(sample_prior = "yes", refresh = 0)
+
+#This is confidence intervals, it is not necessary.
+day.brm3 |> conditional_effects() |>  plot(points=TRUE)
+```
+
+
+```{r}
+#|label: Checking posterior and prior comparison
+
+#This is the way to show how influential are your priors. We dont want the priors and posteriors to be similar which might mean priors are influencing posteriors. We dont want that.
+day.brm3 |>  SUYR_prior_and_posterior()
+```
+
+where $\boldsymbol{\beta}$ is a vector of effects parameters and $\bf{X}$ is a model matrix representing the intercept and treatment contrasts for the effects of Treatment on barnacle recruitment.
+
+
+# MCMC sampling diagnostics
+
+```{r}
+#These are all just noise, the chains are mixed well
+day.brm3$fit |> stan_trace()
+
+#Autocorrelation plots, you dont want your samples to be correlating, thats why we are doing thinning, if there were any spikes rather than the point 0, that would mean there is correlation.
+day.brm3$fit |> stan_ac()
+
+# We are checking convergence levels with rhat, we want all want them to be less than 1.01, if they are not, it means the chains need to run longer. to converge more.
+day.brm3$fit |> stan_rhat()
+
+#If you have less than 0.5 effective sample size, it is because of your priors being to wide, you might wanna tighten your priors range.
+day.brm3$fit |> stan_ess()
+
+#Density plot shows distribution of our posterior plots. Based on the data, based on the Poisson, and it is not because of the priors, we already said priors are not influential. Chains showed same thing which means they run enough.
+day.brm3$fit |> stan_dens(separate_chains = TRUE)
+```
+
+```{r}
+#|label: Checking the residuals of chains
+day.resids <- make_brms_dharma_res(day.brm3, integerResponse = TRUE)
+testUniformity(day.resids)
+
+plotResiduals(day.resids)
+
+#we need to make sure dispersion is actually 1 now (mean/variance = 1). We assumed it was 1 but we have to check. If the model is over-dispersed (more variance than what is expected) it means it is under-estimating the variance. It will artifically inflate your power. You will be left to believe that effects are greater than they are.
+testDispersion(day.resids)
+
+#it shows slight under-dispersion. It is okay since it is difficult to achieve 1 and it makes your test more conservative. (0.6953) Better than over-dispersion.
+```
+
+
+# Model validation 
+
+```{r}
+#This plot shows there is difference in recruitment of barnacles on different substrate.
+day.brm3 |> conditional_effects() |> plot(points = TRUE)
+```
+
+
+# Partial effects plots 
+
+
+# Model investigation 
+
+```{r}
+day.brm3 |> summary() #estimate results are log transformed. If you want to check the original value exp(value) on console. Remember intercept is the mean of b0 which we assigned to NB substrate. 
+# If the Confidence intervals cross the value "0" suggests low evidence of the result, such as row TREATS. 
+
+#The way we calculate how much more or less of the means of other substrates compared to substrate NB is:
+#For ALG1 -> exp(0.39) = 1.476981 -> suggests ~48% increased recruitment we have on ALG1 substrate compared to NB.
+#For ALG2 -> exp(0.63) = 1.8776 -> suggests ~88% increased recruitment we have on ALG substrate compared to NB.
+#For S -> exp(-0.14) -> 0.86935 -> suggests ~13% decreased recruitment we have on S substrate compared to NB.
+```
+
+
+```{r}
+day.brm3 |> 
+  as_draws_df() |> 
+  exp() |> 
+  as.data.frame() |> 
+  dplyr::select(starts_with("b")) |>
+  summarise_draws( 
+  median, 
+  HDInterval::hdi,
+  rhat,
+  length,
+  ess_bulk,
+  ess_tail 
+)
+
+# In this table, since it is exponentiated now, the calculations are transformed to multiplication and division, Our marker of no change becomes 1, so we can now calculate the probability of recruitments of barnacle being greater or less than 1. Chance of them increase or decrease with respect to given substrates.
+
+day.brm3 |> 
+  as_draws_df() |> 
+  exp() |> 
+  as.data.frame() |> 
+  dplyr::select(starts_with("b")) |>
+  summarise_draws( 
+  median, 
+  HDInterval::hdi,
+  rhat,
+  length,
+  ess_bulk, ess_tail,
+  Pg1 = ~mean(.x > 1),
+  Pg1.1 = ~mean(.x > 1.1),
+  Pl0.9 = ~mean(.x < 0.9),
+  Pl1 = ~mean(.x < 1)
+)
+
+# The TREATS column again suggests weak evidence which is due to being less than 85% (85% is sort of a rule of thumb for strong evidence)
+```
+
+
+# Further investigations 
+
+```{r}
+day.brm3 |> 
+  emmeans (~TREAT, type = 'response') |> # type = 'response' back transforms and we see the numbers for means.
+  pairs() # remember when we are testing both ends (lower or higher recruit) we have two tails so the distribution will remain in middle and end tails will consist of 2.5%. when we have probability of 95% of interval probability. if it is higher lets say -> we go 97.5% of being higher (95% + 2.5%). (Intervals should not remain 1 in between (Why 1? because they are back transformed so the they are exponentiated, therefore "1" is the marker of no change))
+```
+
+```{r}
+#| label: post-Hoc 
+#| fig-cap: effect size
+#| 
+day.posthoc <-
+#POST-HOC
+day.brm3 |> 
+  emmeans(~TREAT) |> 
+  pairs() |> 
+  tidy_draws() |> 
+  exp() |> 
+summarise_draws(
+  median,
+  HDInterval::hdi,
+  Pg1 = ~mean(.x>1),
+  Pl1 = ~mean(.x<1)
+)
+
+day.fig1 <-
+day.posthoc |> 
+  as.data.frame() |> 
+  mutate(flag = ifelse(upper < 1, "negative",
+  ifelse(lower > 1, "positive", "null"))) |> 
+  ggplot(aes(y = variable, x = median)) +
+  geom_vline(xintercept = 1, linetype = "dashed") +
+  geom_pointrange(aes(xmin = lower, xmax = upper, color = flag)) +
+  scale_x_continuous("Effect Size (%)",
+      trans = scales::log2_trans(),
+      labels = function(x) 100 * (x-1)
+      ) + #log2_trans transformation makes it look symmetrical.
+  scale_colour_manual("Effect",
+      values = c("red", "black", "green")
+      ) +
+  theme_classic()
+
+day.fig1
+ 
+ggsave(file = "day.fig1.png", day.fig1, width = 6, height = 6/1.6, dpi = 300)
+
+#When you are using the effects, make sure to log2_trans scaled which makes it symmetrical around 1.
+```
+
+
+```{r}
+# Creating different comparisons. Positive needs to add up to 1, negatives need to add up to 1.
+
+#1- Comp 1: ALG2 (1) vs ALG1 (-1) vs -> Try to give higher ones the positive values otherwise the  difference becomes negative COMP1 = ALG2 vs ALG1
+#2- Comp 2: ALG1(1/2) + ALG2(1/2) vs NB(-1/2) + S (-1/2)
+#3- Comp 3: NB(1) vs S(0) 
+#4- Comp4: ALG1(1/3) + ALG2(1/3) + NB(1/3) vs S(-1)
+
+#          Comp1   Comp2   Comp3   Comp4
+#  NB       0      -1/2      1      1/3
+#  ALG1    -1       1/2      0      1/3
+#  ALG2     1       1/2      0      1/3
+#  S        0      -1/2     -1      -1
+ 
+
+cmat <- cbind("Alg2 vs Alg1" = c(0, -1, 1, 0),
+"Algae vs Bare" = c(-1/2,1/2,1/2,-1/2),
+"Nat.Bare vs Scraped" = c(1,0,0,-1),
+"Nat. vs Artif." = c(1/3,1/3,1/3,-1)
+)
+
+day.brm3 |> 
+  emmeans(~TREAT, type = 'response') |> 
+  contrast(method = list(TREAT =cmat)) #automatic summary that comes from contrast function
+
+
+day.brm3 |> 
+  emmeans(~TREAT, type = "link") |> 
+  contrast(method = list(TREAT =cmat)) |> 
+  tidy_draws() |> 
+  exp() |> 
+summarise_draws( 
+  median, 
+  HDInterval::hdi,
+  Pg1 = ~mean(.x > 1),
+  Pg1.1 = ~mean(.x > 1.1),
+  Pl0.9 = ~mean(.x < 0.9),
+  Pl1 = ~mean(.x < 1)
+)
+# We are making our own summary with the parameters we select.
+
+
+
+day.em <- 
+  day.brm3 |> 
+  emmeans(~TREAT, type = "link") |> 
+  contrast(method = list(TREAT =cmat)) |> 
+  gather_emmeans_draws() |> 
+  mutate(Fit = exp(.value))
+
+day.em
+
+day.em |>
+  ggplot() + 
+    geom_density_ridges(aes(x=Fit, y = contrast), alpha=0.4) +
+    geom_vline(xintercept = 1, linetype = 'dashed')
+```
+
+```{r}
+#| label: Quasi R^2
+day.brm3 |>  bayes_R2(summary = FALSE) |> 
+  median_hdci()
+```
+
+
+# Summary Figure
+
+
+# References

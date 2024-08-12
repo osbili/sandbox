@@ -1,0 +1,460 @@
+---
+title: "Bayesian GLMM Part1"
+author: "Murray Logan"
+date: today
+date-format: "DD/MM/YYYY"
+format: 
+  html:
+    ## Format
+    theme: [default, ../resources/ws-style.scss]
+    css: ../resources/ws_style.css
+    html-math-method: mathjax
+    ## Table of contents
+    toc: true
+    toc-float: true
+    ## Numbering
+    number-sections: true
+    number-depth: 3
+    ## Layout
+    page-layout: full
+    fig-caption-location: "bottom"
+    fig-align: "center"
+    fig-width: 4
+    fig-height: 4
+    fig-dpi: 72
+    tbl-cap-location: top
+    ## Code
+    code-fold: false
+    code-tools: true
+    code-summary: "Show the code"
+    code-line-numbers: true
+    code-block-border-left: "#ccc"
+    code-copy: true
+    highlight-style: atom-one
+    ## Execution
+    execute:
+      echo: true
+      cache: true
+    ## Rendering
+    embed-resources: true
+crossref:
+  fig-title: '**Figure**'
+  fig-labels: arabic
+  tbl-title: '**Table**'
+  tbl-labels: arabic
+engine: knitr
+output_dir: "docs"
+documentclass: article
+fontsize: 12pt
+mainfont: Arial
+mathfont: LiberationMono
+monofont: DejaVu Sans Mono
+classoption: a4paper
+bibliography: ../resources/references.bib
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+knitr::opts_chunk$set(cache.lazy = FALSE,
+                      tidy = "styler")
+options(tinytex.engine = "xelatex")
+```
+
+
+# Preparations
+
+Load the necessary libraries
+
+```{r}
+#| label: libraries
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false
+
+library(tidyverse)  #for data wrangling etc
+library(rstanarm)   #for fitting models in STAN
+library(cmdstanr)   #for cmdstan
+library(brms)       #for fitting models in STAN
+library(standist)   #for exploring distributions
+library(HDInterval) #for HPD intervals
+library(posterior)  #for posterior draws
+library(coda)       #for diagnostics
+library(bayesplot)  #for diagnostics
+#library(ggmcmc)     #for diagnostics
+library(rstan)      #for interfacing with STAN
+library(DHARMa)     #for residual diagnostics
+library(emmeans)    #for marginal means etc
+library(broom)      #for tidying outputs
+library(broom.mixed) #for tidying MCMC outputs
+library(tidybayes)  #for more tidying outputs
+library(ggeffects)  #for partial plots
+library(patchwork)  #for multiple figures
+library(bayestestR) #for ROPE
+library(see)        #for some plots
+library(ggridges)   #for ridge plots
+library(easystats)     #framework for stats, modelling and visualisation
+library(modelsummary)
+source('helperFunctions.R')
+```
+
+# Scenario
+
+A plant pathologist wanted to examine the effects of two different
+strengths of tobacco virus on the number of lesions on tobacco leaves.
+She knew from pilot studies that leaves were inherently very variable
+in response to the virus. In an attempt to account for this leaf to
+leaf variability, both treatments were applied to each leaf. Eight
+individual leaves were divided in half, with half of each leaf
+inoculated with weak strength virus and the other half inoculated with
+strong virus. So the leaves were blocks and each treatment was
+represented once in each block. A completely randomised design would
+have had 16 leaves, with 8 whole leaves randomly allocated to each
+treatment.
+
+![Tobacco plant](../resources/TobaccoPlant.jpg){#fig-tobacco height="300"}
+
+:::: {.columns}
+
+::: {.column width="50%"}
+
+LEAF   TREAT    NUMBER
+------ -------- --------
+1      Strong   35.898
+1      Week     25.02
+2      Strong   34.118
+2      Week     23.167
+3      Strong   35.702
+3      Week     24.122
+\...   \...     \...
+
+: Format of tobacco.csv data files {#tbl-tobacco .table-condensed}
+
+:::
+
+::: {.column width="50%"}
+
+------------ ----------------------------------------------------------------------------------------------------
+**LEAF**     The blocking factor - Factor B
+**TREAT**    Categorical representation of the strength of the tobacco virus - main factor of interest Factor A
+**NUMBER**   Number of lesions on that part of the tobacco leaf - response variable
+------------ ----------------------------------------------------------------------------------------------------
+
+: Description of the variables in the tobacco data file {#tbl-tobacco1 .table-condensed}
+
+:::
+::::
+
+
+# Read in the data
+
+```{r}
+#| label: readData
+tobacco <- read_csv("../data/tobacco.csv", trim_ws = TRUE)
+```
+
+ 
+
+# Exploratory data analysis
+
+```{r}
+#|label:Identify 
+
+# Random effects -> leaf
+
+# Since all of them has been treated same -> Treatment becomes fixed effect and falls onder
+
+#   LEAF (R)
+#   TREAT (F)
+
+# We need to define any categorical variables as factor. (Treatment) Always define random effects categorical -> factor, they are always considered as categorical not numbers.
+
+tobacco <- tobacco |> 
+  mutate(LEAF = factor(LEAF), 
+         TREATMENT = factor(TREATMENT))
+```
+
+```{r}
+#| label: Change the data variable
+
+# They are mean values so Gaussian will work. 
+# We need to account for different slopes as well as different intercepts.
+
+tobacco |> 
+  ggplot(aes( y = NUMBER, x = TREATMENT)) +
+  geom_boxplot()
+
+# Even though shape looks slightly skewed, the sample size is very small so this will suffice. Non obvious non-normality.
+# For variance, you need to account for all data, there are two outliers that will contribute to the variance. Given the dataset is so small the difference in size of the boxes does not very evidently account for variance.
+```
+
+```{r}
+#| label: Plot for mixed effect
+
+# We group each random within themselves so they each will have separate intercepts which accounts for susceptible have their own slope.
+
+ggplot(tobacco, aes(y = NUMBER, x = TREATMENT, group = LEAF)) + # group -> plotting a separate trend for each of our randoms
+  geom_point() +
+  geom_line(aes(x = as.numeric(TREATMENT)))
+```
+
+
+Model formula:
+$$
+\begin{align}
+y_{i,j} &\sim{} \mathcal{N}(\mu_{i,j}, \sigma^2)\\
+\mu_{i,j} &=\beta_0 + \bf{Z_j}\boldsymbol{\gamma_j} + \bf{X_i}\boldsymbol{\beta} \\
+\beta_0 &\sim{} \mathcal{N}(35, 20)\\
+\beta_1 &\sim{} \mathcal{N}(0, 10)\\
+\boldsymbol{\gamma_j} &\sim{} \mathcal{N}(0, \boldsymbol{\Sigma})\\
+\boldsymbol{\Sigma} &= \boldsymbol{D}({\sigma_l})\boldsymbol{\Omega}\boldsymbol{D}({\sigma_l})\\
+\boldsymbol{\Omega} &\sim{} LKJ(\zeta)\\
+\sigma_j^2 &\sim{} \mathcal{Cauchy}(0,5)\\
+\sigma^2 &\sim{} Gamma(2,1)\
+\end{align}
+$$
+
+where:
+
+- $\bf{X}$ is the model matrix representing the overall intercept and
+  effects of the treatment on the number of lesions.
+- $\boldsymbol{\beta}$ is a vector of the population-level effects
+  parameters to be estimated.
+- $\boldsymbol{\gamma}$ is a vector of the group-level effect parameters
+- $\bf{Z}$ represents a cell means model matrix for the random intercepts (and
+  possibly random slopes) associated with leaves.
+- the population-level intercept ($\beta_0$) has a gaussian prior with location
+  of 31 and scale of 10
+- the population-level effect ($\beta_1$) has a gaussian prior with location of
+  0 and scale of 10
+- the group-level effects are assumed to sum-to-zero and be drawn from a
+  gaussian distribution with mean of 0 and covariance of $\Sigma$  
+- $\boldsymbol{\Sigma}$ is the variance-covariance matrix between the
+  groups (individual leaves).  It turns out that it is difficult to
+  apply a prior on this covariance matrix, so instead, the covariance
+  matrix is decomposed into a correlation matrix
+  ($\boldsymbol{\Omega}$) and a vector of variances
+  ($\boldsymbol{\sigma_l}$) which are the diagonals ($\boldsymbol{D}$)
+  of the covariance matrix.
+- $\boldsymbol{\Omega}$ 
+$$
+\gamma \sim{} N(0,\Sigma)\\
+\Sigma -> \Omega, \tau\\
+$$
+where $\Sigma$ is a covariance matrix.
+
+# Fit the model
+
+```{r}
+#| label: Setting priors
+
+
+tobacco |> 
+  group_by(TREATMENT) |> 
+  summarise(median(NUMBER),
+            mad(NUMBER))
+
+# b0 ~ N(,) -> N(35,2.7) -> we chose random
+# b1 ~ N(0,10) -> there is no definitive slope so 0. varience between strong and weak is around 10
+# variance1 ~ t(3,0,3) -> last 3 is more rounded version of 2.7 - 3.54 , just to fit within range just in case, doesnt really matter. 3.54 is slightly more varied than 2.7 thats why.
+# omega ~ N(0, variance2) 
+# variance2 ~ t(3,0,3) -> the second variance is introduced by prior omega, which we incorporate to soak up some variance.
+
+```
+
+```{r}
+#| label: Fitting the model
+
+# RANDOM INTERCEPT MODEL
+
+tobacco.form <- bf(NUMBER ~ (1|LEAF) + TREATMENT, # (1|LEAF) 1 stands for intercept -> intercept is conditional on or varies with LEAF.
+                   family = gaussian()
+                   )
+
+get_prior(tobacco.form, data = tobacco) # -> 33.1 for intercept comes from mean whereas we used median, for 6.5 it took sd multiplied by 2.5 which R always does apperantally.
+
+priors <- prior(normal(35,6), class = 'Intercept') +
+  prior(normal(0,10), class = 'b') +
+  prior(student_t(3,0,3), class = 'sigma') +
+  prior(student_t(3,0,3), class = 'sd')
+```
+# MCMC sampling diagnostics 
+```{r}
+#|label: Running MCMC
+
+
+tobacco.brm2 <- brm(tobacco.form,
+                    data = tobacco,
+                    prior = priors,
+                    sample_prior = 'only',
+                    iter = 5000,
+                    warmup = 1000,
+                    chains = 3, cores = 3,
+                    thin = 5,
+                    refresh = 0,
+                    backend = 'cmdstanr')
+```
+
+# Partial effects plots
+
+```{r}
+#| label: Plotting Priors
+tobacco.brm2 |> conditional_effects() |> plot(points = TRUE)
+```
+```{r}
+tobacco.brm3 <- update(tobacco.brm2, sample_prior = "yes")
+```
+
+```{r}
+tobacco.brm3 |> conditional_effects() |> plot(points = TRUE)
+```
+
+
+# Model investigation
+
+```{r}
+#| label: Checking priors and posteriors
+
+
+tobacco.brm3 |> SUYR_prior_and_posterior()
+```
+
+
+# Further investigations
+
+```{r}
+tobacco.brm3$fit |> stan_trace()
+tobacco.brm3$fit |> stan_ac()
+tobacco.brm3$fit |> stan_rhat()
+tobacco.brm3$fit |> stan_ess()
+```
+
+
+```{r}
+#| label: Adjusted formula
+
+# Adjusted the formula to include random intercept and random slope.
+
+tobacco.form <- bf(NUMBER ~ (TREATMENT|LEAF) + TREATMENT,
+                   family = gaussian()
+                   )
+
+# check what priors this formula needs
+get_prior(tobacco.form, data = tobacco) # there is a new addition of prior that needs to be addressed called 'cor' which measures the intercept and slope correlation. it has to be included but there is no attention is needed. it has a default prior and only that one works for the 'cor'.
+```
+
+```{r}
+#| label: Adding the cor prior
+
+priors <- prior(normal(35,6), class = 'Intercept') +
+  prior(normal(0,10), class = 'b') +
+  prior(student_t(3,0,3), class = 'sigma') +
+  prior(student_t(3,0,3), class = 'sd') +
+  prior(lkj_corr_cholesky(1), class = 'cor')
+
+#| label: Running the model again with new prior
+
+
+tobacco.brm4 <- brm(tobacco.form,
+                    data = tobacco,
+                    prior = priors,
+                    sample_prior = 'yes',
+                    iter = 5000,
+                    warmup = 1000,
+                    chains = 3, cores = 3,
+                    thin = 5,
+                    refresh = 0,
+                    control = list(adapt_delta = 0.99, max_treedepth = 20),
+                    backend = 'cmdstanr'
+                    ) 
+
+# divergence error means the sampling was done too crude for our data. meaning the imaginary ball was kicked out of the mountain while forming the chain. we can teach the sampler to sample better by increasing the learning capacity. it will take longer to process but the sampling would be more fine tuned. by the line "control" -> adap_delta is set to 0.8 by default. max_treedepth -> length of the 1 sampling unit that covers the sample. Ex: if you set it to 3 -> less coverage in one sample.
+```
+
+```{r}
+#| label: Compare the 2 models
+
+# We are gonna use LOO information criteria (Leave One Out) -> you create a model with leaving 1 observation out and check how model predicts without that observation.
+
+#you take the deviants (unexplained parts) multiply by 2 and penalise it for number of criterias, its called information criteria -> information criteria lower is better, it implies less unexplained models. (looic)
+
+tobacco.brm3 |> loo()
+
+tobacco.brm4 |> loo()
+
+loo_compare(loo(tobacco.brm3), loo(tobacco.brm4))
+```
+
+```{r}
+#| label: Partial for the new model
+
+tobacco.brm3$fit |> stan_trace()
+tobacco.brm3$fit |> stan_ac()
+tobacco.brm3$fit |> stan_rhat()
+tobacco.brm3$fit |> stan_ess()
+```
+
+
+
+```{r}
+#| label: Check how the model fits.
+
+
+tobacco.resids <- make_brms_dharma_res(tobacco.brm4, integerResponse = FALSE)
+testUniformity(tobacco.resids)
+```
+
+```{r}
+#| label: Summarise
+
+
+tobacco.brm3 |> 
+  as_draws_df() |> 
+  #dplyr::select(matches("^b_.*|^sigma$|^sd_.*")) |> 
+  summarise_draws(
+    median,
+    rhat,
+    HDInterval::hdi,
+    ess_bulk,
+    ess_tail,
+    Pg1 = ~mean(.x >0),
+    Pl1 = ~mean(.x <0)
+  )
+
+# ~35 is number of lesions in on strong TREATMENT
+# WeakTREATMENT had on average 7.6 fewer lesions than Strong TREATMENT
+
+# What scale does my response vary? Variation differs more in the smaller scale than bigger scale
+# sigma (variability on difference within the leaf) (smaller scale)
+# intercept (leafs variability on difference) (larger scale)  
+
+# => HIERARCHICAL MODEL SCALE 
+# r_ values are how much the individual intercept is changed from global intercept -> 
+```
+
+```{r}
+#| label: R^2 value 
+
+# R^2 value explains how much of the variation is explained by our treatments.
+
+# Fixed effects alone
+tobacco.brm3 |> bayes_R2(re.form = NA, summary = FALSE) |> 
+  median_hdci()
+
+# Includes random effect 'LEAF'
+tobacco.brm3 |> bayes_R2(re.form = ~(1|LEAF), summary = FALSE) |> 
+  median_hdci()
+
+
+tobacco.brm4|>  bayes_R2(re.form = ~(TREATMENT|LEAF), summary = FALSE) |> 
+  median_hdci()
+
+#Blocking model -> We were able to reduce the noise such that signal was detectable up to 24% more.
+# Compare each R^2. This is because the Block model way introduces the random effect to further explain the variables, reduces the noise. Which was introduced in model4 priors.
+```
+
+
+# References

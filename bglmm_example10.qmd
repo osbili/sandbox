@@ -1,0 +1,414 @@
+---
+title: "Bayesian GLMM Part10"
+author: "Murray Logan"
+date: today
+date-format: "DD/MM/YYYY"
+format: 
+  html:
+    ## Format
+    theme: [default, ../resources/ws-style.scss]
+    css: ../resources/ws_style.css
+    html-math-method: mathjax
+    ## Table of contents
+    toc: true
+    toc-float: true
+    ## Numbering
+    number-sections: true
+    number-depth: 3
+    ## Layout
+    page-layout: full
+    fig-caption-location: "bottom"
+    fig-align: "center"
+    fig-width: 4
+    fig-height: 4
+    fig-dpi: 72
+    tbl-cap-location: top
+    ## Code
+    code-fold: false
+    code-tools: true
+    code-summary: "Show the code"
+    code-line-numbers: true
+    code-block-border-left: "#ccc"
+    code-copy: true
+    highlight-style: atom-one
+    ## Execution
+    execute:
+      echo: true
+      cache: true
+    ## Rendering
+    embed-resources: true
+crossref:
+  fig-title: '**Figure**'
+  fig-labels: arabic
+  tbl-title: '**Table**'
+  tbl-labels: arabic
+engine: knitr
+output_dir: "docs"
+documentclass: article
+fontsize: 12pt
+mainfont: Arial
+mathfont: LiberationMono
+monofont: DejaVu Sans Mono
+classoption: a4paper
+bibliography: ../resources/references.bib
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| cache: false
+
+knitr::opts_chunk$set(cache.lazy = FALSE,
+                      tidy = "styler")
+options(tinytex.engine = "xelatex")
+```
+
+
+# Preparations
+
+Load the necessary libraries
+
+```{r}
+#| label: libraries
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false
+
+library(broom)     #for tidy output
+library(knitr)     #for kable
+#library(effects)   #for partial effects plots
+library(emmeans)   #for estimating marginal means
+library(MASS)      #for glm.nb
+library(tidyverse) #for data wrangling
+library(brms)
+library(tidybayes)
+library(bayesplot)
+library(broom.mixed)
+library(rstan)
+library(patchwork)
+library(modelsummary)
+library(DHARMa)
+source('helperFunctions.R')
+```
+
+
+# Scenario
+
+For over 35 years, the AIMS long term monitoring program has performed
+benthic surveys of coral reefs on the Great Barrier Reef (GBR). To do
+so the team uses two main survey techniques 1) Manta Tow and 2) Photo
+transects. The current example focuses on data collected using the
+later technique.  
+Within each reef, there are three sites on the north east flank and
+within each site there are five permanent transects. Every year, the
+team return and take photos every meter along the transects. Once back
+in the laboratory, five points from every photo are scored according
+to what is represented underneath the point.
+
+The main objective of long-term monitoring is to be able to report on
+status and trends. Specifically, what is the status of each major
+benthic group (such as hard coral, soft coral and macroalgae) and how
+are they changing (particularly in response to major disturbances).
+
+For this example, we will focus on a single reef (Agincourt Reef
+No.1).
+
+# Read in the data
+
+```{r readData, results='markdown', eval=TRUE}
+ltmp <- read_csv('../data/ltmp.csv', trim_ws=TRUE)
+glimpse(ltmp)
+```
+
+| AIMS_REEF_NAME | REPORT_YEAR | SITE_NO | TRANSECT_NO | HC   | n.points | total.points |
+|----------------|-------------|---------|-------------|------|----------|--------------|
+| Arlington Reef | 2006        | 1       | 1           | 10.0 | 20       | 200          |
+| Arlington Reef | 2006        | 1       | 2           | 10.5 | 21       | 200          |
+|                |             |         |             |      |          |              |
+
+
+```{r}
+# HIERARCHY 
+
+# Response is HC, n-points, total-points -> Proportion -> Beta but a beta does not include 0s and 1s which is a problem, what if we had 0% cover of HC? We need to trim it from 0 and from 100 %. so we can say 0.1% for 0's and 0.999 for 100%, we cant trim it too much otherwise we can have outliers. We can use raw data instead of HC which is n-points and total-points. so n-points being success and rest is being failure, it will be binomial.
+
+# ***ALWAYS USE RAW DATA!!
+
+# REPORT_YEAR -> Fixed effect
+# ¥ ~ Bin(πi, n)
+# log(π/(1-π)) (logit) -> b0 + b1x1 ...... + YZ0
+# We are going to focus on 1 reef. SITE_NO (R), TRANSECT_NO (R)
+```
+
+
+
+
+# Data preparation
+
+```{r}
+#| label: Data Prep
+ltmp_sub <- ltmp |> 
+  filter(AIMS_REEF_NAME == "Agincourt Reef No.1") |> 
+  droplevels() |>  # If some places have 4 sites or more transects but Agincourt didn't, it still should think there might be more. so its important to droplevels right after filter to prevent.
+mutate(
+  REEF_SITE = factor(paste(AIMS_REEF_NAME, SITE_NO)), # To specify the site names of different reefs
+  REEF_SITE_TRANSECT = factor(paste(REEF_SITE, TRANSECT_NO))
+)
+```
+
+
+
+# Exploratory Data Analysis
+
+```{r}
+#| label: Plot the data
+
+ltmp_sub |> 
+  ggplot(aes(y= HC, x = REPORT_YEAR)) +
+  geom_point() +
+  geom_smooth(aes(group = REEF_SITE_TRANSECT), alpha = 0.1) +
+  theme_bw()
+
+ltmp_sub |> 
+  group_by(REPORT_YEAR) |> 
+  summarise(mean(total.points)) |> as.data.frame()
+# Treat year as categories, then first year would be the intercept in the formula,
+# 1995 is not a good year to choose as intercept because it has substantially low amount of sampled points among other years.
+
+```
+
+```{r}
+ltmp_sub <- ltmp_sub |> 
+  mutate(fREPORT_YEAR = factor(REPORT_YEAR),
+         fREPORT_YEAR = factor(fREPORT_YEAR, levels = rev(levels(fREPORT_YEAR)))
+         )
+
+ltmp_sub |> 
+  group_by(fREPORT_YEAR) |> 
+  summarise(mean(total.points)) |> as.data.frame()
+#Categorical now so we no longer center the data, you can't do that with categorical data.
+```
+
+# Fit the model
+
+```{r}
+#| label: Priors
+
+## Set priors
+#Intercept now becomes the mean of 2023. We reversed the dataframe now 2023 is the first one.
+
+
+ltmp_sub |> 
+  group_by(fREPORT_YEAR) |> 
+  summarise(
+    Median = median(qlogis(n.points/total.points)), # (qlogis) -> transforms it into logit scale. (plogis) back transforms, keeping it in logit scale helps to come up with priors
+    MAD = mad(qlogis(n.points/ total.points)),
+    N = mean(total.points)
+  ) |> 
+  as.data.frame()
+
+#b0 ~ N(-0.8, 0.3)
+#b1 ~ N(0, 1.5)  
+#variance ~ N(3,0,0.5)
+
+## Creating Formula
+ltmp_sub.form <- bf(n.points | trials(total.points) ~ fREPORT_YEAR +
+                      (1 | REEF_SITE) + (1 | REEF_SITE_TRANSECT),
+                    family = binomial(link = 'logit')
+                    )
+
+get_prior(ltmp_sub.form, data = ltmp_sub)
+
+priors <- prior(normal(-0.8,0.3), class = "Intercept") +
+  prior(normal(0,1.5), class = "b") +
+  prior(student_t(3,0,0.5), class = "sd") 
+
+```
+```{r}
+#| label: Set Model
+
+
+ltmp_sub.brm2 <- brm(ltmp_sub.form,
+                   data = ltmp_sub,
+                   prior = priors,
+                   sample_prior = 'only',
+                   iter = 5000,
+                   warmup = 1000,
+                   chain = 3, cores = 3,
+                   thin = 5,
+                   refresh = 0,
+                   backend = 'cmdstanr'
+                   )
+
+
+ltmp_sub.brm2 |> 
+  conditional_effects(conditions = data.frame(total.points = 200)) |> 
+  plot(points = TRUE, ask = FALSE) 
+# Intercept is smaller because it was determined by Intercept prior only, rest are determined by 2 other prior
+ltmp_sub.brm3 <- update(ltmp_sub.brm2, sample_prior = 'yes', chains = 3, cores = 3, control = list(adapt_delta = 0.99, max_treedepth = 20),
+refresh = 100) 
+
+ltmp_sub.brm3 |> 
+  conditional_effects(conditions = data.frame(total.points = 200)) |> 
+  plot(points = TRUE, ask = FALSE) 
+
+# The reason why estimate of year 1995 is at highest among the rest of the prediction is because we assigned total points to be 200 where the actual mean for 1995 data points is ~155 much lower.
+```
+
+::: {.panel-tabset}
+
+
+:::
+
+# MCMC sampling diagnostics
+
+```{r}
+#| label: Diagnostics
+
+pars <- ltmp_sub.brm3 |> get_variables() |> str_subset("^b_.*|^sd_.*")
+
+# ltmp_sub.brm3|> SUYR_prior_and_posterior() formula does not suit this function
+ltmp_sub.brm3$fit |> stan_trace(pars = pars) # set pars so we can have all the interactions and parameters
+ltmp_sub.brm3$fit |> stan_ac(pars = pars) # There is some correlation -> we could thin more to reduce that correlation.
+ltmp_sub.brm3$fit |> stan_rhat()
+ltmp_sub.brm3$fit |> stan_ess() 
+ltmp_sub.brm3 |>  pp_check(type = 'dens_overlay',, ndraws = 100)
+
+ltmp_sub.resids <- make_brms_dharma_res(ltmp_sub.brm3, integerResponse = FALSE)
+testUniformity(ltmp_sub.resids)
+plotResiduals(ltmp_sub.resids, quantreg = FALSE)
+testDispersion(ltmp_sub.resids)
+plotResiduals(ltmp_sub.resids)
+
+ltmp_sub.brm3 |>  hypothesis('fREPORT_YEAR2021 = 0') |> plot() # -> is a way to check how priors cover posteriors, in this one we see priors are much wider than posteriors.
+```
+
+
+::: {.panel-tabset}
+
+
+:::
+
+# Model validation 
+```{r}
+ltmp_sub.brm3 |> 
+  as_draws_df() |> # extracting draws from parameters.
+  dplyr::select(matches("^b_.*|^sd_.*")) |> # selecting parameters we are interested in
+  mutate(across(matches("^b_Intercept"), plogis)) |> # back transforming it from (π/(1-π)) to π in logit formula.
+  mutate(across(matches("^b_[^I].*"), exp)) |> # include the ones starts with b does not include I.
+  summarise_draws(
+    median,
+    HDInterval::hdi,
+    ess_bulk,
+    ess_tail,
+    rhat,
+    Pl = ~mean(.x <1),
+    Pg = ~mean(.x >1)
+  )
+
+# logit, exp -> /(1 -π) : all the other parameters starts with "b_"
+# logit, plogis -> π -> Intercept 
+
+# We have 32% coral cover in 2023, we have 95% confidence in saying that.
+# In 2021, the coral cover is lower than it is in 2023. 40% less.
+```
+
+
+```{r}
+#| label: Compare and/contrast the 2023/2021
+
+# Percentage change in Percentage Cover
+ltmp_sub.brm3 |> 
+  emmeans(~fREPORT_YEAR, type ='response', at = list(fREPORT_YEAR = c(2023,2021))) |> 
+  pairs() |>
+  tidy_draws() |> 
+  exp() |> 
+  summarise_draws(
+    median,
+    HDInterval::hdi,
+    ess_bulk,
+    ess_tail,
+    Pl = ~mean(.x<1),
+    Pg = ~mean(.x>1)
+  )
+# since 2021 the coral cover got 66% higher
+
+
+# Absolute change in Percentage Cover
+ltmp_sub.brm3 |> 
+  emmeans(~fREPORT_YEAR, type ='response', at = list(fREPORT_YEAR = c(2023,2021))) |> regrid() |> 
+  pairs() |>
+  tidy_draws() |> 
+  exp() |> 
+  summarise_draws(
+    median,
+    HDInterval::hdi,
+    ess_bulk,
+    ess_tail,
+    Pl = ~mean(.x<1),
+    Pg = ~mean(.x>1)
+  )
+
+# From 2021 to 2023 it has increased ~10.1% of absolute units in coral cover percentage.
+```
+
+
+```{r}
+#| label: Plot
+
+ltmp_sub.brm3 |> 
+  emmeans(~fREPORT_YEAR, type ='response') |> 
+ as.data.frame() |> 
+  mutate(
+    fREPORT_YEAR = factor(fREPORT_YEAR, levels = rev(levels(fREPORT_YEAR))),
+    REPORT_YEAR = as.numeric(as.character(fREPORT_YEAR))
+  ) |> 
+  ggplot(aes( y = prob, x = REPORT_YEAR)) +
+  geom_ribbon(aes(ymin = lower.HPD, ymax = upper.HPD), fill = 'orange', alpha = 0.5) +      geom_line() +
+  geom_point() +
+  theme_classic() +
+  scale_y_continuous("Live Hard Coral Cover", label = scales::percent_format())
+
+summarise(data)
+```
+
+```{r}
+#| label: Comparing average of 1999:2005 to year 2012, increase/decrease?
+
+#Percentage change in Percentage Cover
+cmat <- cbind(c(rep(-1/7, 7),1))
+ltmp_sub.brm3 |> 
+  emmeans(~fREPORT_YEAR, type ='response', at = list(fREPORT_YEAR = c(1999:2005,2012))) |>
+  contrast(method = list(fREPORT_YEAR = cmat))
+
+#Absolute Unit change in Percentage Cover
+cmat <- cbind(c(rep(-1/7, 7),1))
+ltmp_sub.brm3 |> 
+  emmeans(~fREPORT_YEAR, type ='response', at = list(fREPORT_YEAR = c(1999:2005,2012))) |>
+  regrid() |> 
+  contrast(method = list(fREPORT_YEAR = cmat))
+```
+
+
+::: {.panel-tabset}
+
+
+:::
+
+# Model investigation 
+
+::: {.panel-tabset}
+
+
+:::
+
+
+# Further investigations 
+
+::: {.panel-tabset}
+
+:::
+
+

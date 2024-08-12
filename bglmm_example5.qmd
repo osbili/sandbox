@@ -1,0 +1,463 @@
+---
+title: "Bayesian GLMM Part5"
+author: "Murray Logan"
+date: today
+date-format: "DD/MM/YYYY"
+format: 
+  html:
+    ## Format
+    theme: [default, ../resources/ws-style.scss]
+    css: ../resources/ws_style.css
+    html-math-method: mathjax
+    ## Table of contents
+    toc: true
+    toc-float: true
+    ## Numbering
+    number-sections: true
+    number-depth: 3
+    ## Layout
+    page-layout: full
+    fig-caption-location: "bottom"
+    fig-align: "center"
+    fig-width: 4
+    fig-height: 4
+    fig-dpi: 72
+    tbl-cap-location: top
+    ## Code
+    code-fold: false
+    code-tools: true
+    code-summary: "Show the code"
+    code-line-numbers: true
+    code-block-border-left: "#ccc"
+    code-copy: true
+    highlight-style: atom-one
+    ## Execution
+    execute:
+      echo: true
+      cache: true
+    ## Rendering
+    embed-resources: true
+crossref:
+  fig-title: '**Figure**'
+  fig-labels: arabic
+  tbl-title: '**Table**'
+  tbl-labels: arabic
+engine: knitr
+output_dir: "docs"
+documentclass: article
+fontsize: 12pt
+mainfont: Arial
+mathfont: LiberationMono
+monofont: DejaVu Sans Mono
+classoption: a4paper
+bibliography: ../resources/references.bib
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| cache: false
+
+knitr::opts_chunk$set(cache.lazy = FALSE,
+                      tidy = "styler")
+options(tinytex.engine = "xelatex")
+```
+
+# Preparations
+
+Load the necessary libraries
+
+```{r}
+#| label: libraries
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false
+library(tidyverse) #for data wrangling
+library(car)       #for regression diagnostics
+library(broom)     #for tidy output
+#library(ggfortify) #for model diagnostics
+library(knitr)     #for kable
+library(emmeans)   #for estimating marginal means
+library(MASS)      #for glm.nb
+library(brms)
+library(broom.mixed)
+library(tidybayes)
+library(bayesplot)
+library(standist)   #for visualizing distributions
+library(rstanarm)
+library(cmdstanr)   #for cmdstan
+library(ggeffects)
+library(rstan)
+library(DHARMa)
+library(ggridges)
+library(easystats)     #framework for stats, modelling and visualisation
+library(patchwork)
+library(modelsummary)
+source('helperFunctions.R')
+```
+
+# Scenario
+
+Some ornithologists were interested in the degree of sibling negotiations in owl
+chicks.  Specifically, they wanted to explore how sibling negotiations were
+affected by feeding satiety and the sex of the parent returning to the nest.
+The ornithologists had accessed to a number of owl nests and were able to count
+(via recording equipment) the number of sibling negotiations (calls) that the
+owl chicks made when the parent returned to the nest.
+
+We could hypothesise that the chicks might call more if they were hungry.  As
+part of the investigation, the researchers were able to provided supplementary
+food.  As such, they were able to manipulate the conditions such that sometimes
+the chicks in a nest would be considered deprived of supplementary food and at
+other times they were satiated.  
+
+As a parent returned, the researchers recorded the number of sibling
+negotiations (calls) along with the sex of the parent.  Since the number of
+calls is likely to be a function of the number of chicks (the more chicks the
+more calls), the researchers also counted the number of siblings in the brood. 
+
+Each nest was measured on multiple occasions.  Hence, we must include the nest
+as a random effect to account for the lack of independence between observations
+on the same set of siblings.
+
+# Read in the data
+
+```{r readData, results='markdown', eval=TRUE}
+owls <- read_csv("../data/owls.csv", trim_ws = TRUE)
+```
+
+
+```{r}
+# Response variables -> number of calls.
+# Treatment effect (main predictors) -> sex of the parent + Food treatment.
+# Each owl family used for each treatment.
+# Brood size of the nest -> maybe more males do more calling
+```
+
+```{r}
+# Food amount and sex of parent are the things we want to look at and see if they effect the amount of calling and we will also check to see if there is interaction.
+
+# We might incorporate NegPerChick because we are interested in how many callings per chick but we wont use that. We will incorporate the sibling negotiation -> because Poisson distribution makes more sense for this type of data.
+
+#Nest -> random effect, they are just replicates, dont wannt compare.
+
+
+#Hierarchy
+
+#Each nest gets each treatment so -> NEST (R) -> FoodTreatment
+#Each nest gets both male and female parent -> NEXT (R) -> SexParent
+# -> FoodTreatment:SexParent
+# -> BroodSize -> offset -> standardizes for a particular predictor, but unlike other predictors, you dont estimate what the effect is for the offset, it is assumed to have a slope of 1.
+
+# it assumes Call and BroodSize are parralel -> Ex: 4 Brood = 4 Calls,
+# To stick with a Poisson distribution we dont divide calls/broodsize to find negperchick. We put the broodsize as offset predictor and assume the slope 1 so that we can fit BroodSize in the equation and keep the distribution as Poisson.
+
+# -> Calls ~ FoodTreatment * SexParent + (1|Nest) + offset(BroodSize)
+
+# Poisson has log link so -> log(Calls) ~ FoodTreatment * SexParent + (1|Nest) +log(offset(BroodSize))
+```
+
+# Data preparation
+
+```{r}
+owls <- owls |> 
+mutate(Nest = factor(Nest),
+       FoodTreatment = factor(FoodTreatment),
+       SexParent = factor(SexParent),
+       NCalls = SiblingNegotiation)
+```
+
+# Exploratory data analysis
+
+```{r}
+ggplot(data = owls, aes(y = NCalls, x = FoodTreatment, colour = SexParent)) +
+  geom_violin() +
+  geom_point(position = position_jitterdodge(jitter.height = 0, dodge.width = 1))
+```
+
+# Or
+```{r}
+#| label: To check situation for random intercept/random slope
+
+
+ggplot(data=owls) +
+  geom_point(aes(y=NCalls, x=FoodTreatment, colour = SexParent), position = position_dodge(0.5)) +
+  facet_wrap(~Nest)
+```
+
+
+Model formula:
+$$
+y_i \sim{} \mathcal{Pois}(\lambda_i)\\
+ln(\lambda_i) =\boldsymbol{\beta} \bf{X_i} + \boldsymbol{\gamma} \bf{Z_i}
+$$
+```{r}
+#|label: Formula
+
+# 1st step -> set intercept and check
+owls.form <- bf(NCalls ~ 1 +
+                  offset(log(BroodSize)) + (1|Nest), family = poisson(link ='log'))
+
+#2nd Then add the predictors so you can tell if something is wrong you can tell which step is the reason
+owls.form <- bf(NCalls ~ FoodTreatment*SexParent + offset(log(BroodSize)) + (1|Nest), family = poisson(link='log'))
+```
+
+```{r}
+#| label: Setting Priors
+
+
+owls |> 
+  group_by(FoodTreatment, SexParent) |> 
+  summarise(mean = log(median(NCalls/BroodSize)),
+            MAD = log(mad(NCalls/BroodSize)))
+#b0 = (0.4, 0.7)
+#b1 = (0, 1.5) # encourage slope to go to direction whereever they want to go -> there for it is set (0, ..) for b1
+#variance = (3,0.8)
+priors <- prior(normal(0.4,0.7), class = 'Intercept') +
+  prior(normal(0,1.5), class = 'b') +
+  prior(student_t(3,0,0.8), class = 'sd')
+```
+
+```{r}
+get_prior(owls.form, data = owls)
+```
+
+# Fit the model 
+
+```{r}
+owls.brm2 <- brm(owls.form,
+                 data = owls,
+                 prior = priors,
+                 sample_prior = 'only',
+                 iter = 10000,
+                 warmup = 1000,
+                 chains = 3,
+                 cores = 3,
+                 thin = 10,
+                 refresh = 0,
+                 seed = 123,
+                 control = list(adapt_delta = 0.99),
+                 backend = "cmdstanr"
+                 )
+```
+# MCMC sampling diagnostics 
+
+```{r}
+owls.brm2 |> 
+  conditional_effects("FoodTreatment:SexParent") |> plot(points = TRUE)
+```
+
+```{r}
+owls.brm3 <- update(owls.brm2, 
+                    sample_prior = 'yes',
+                    iter = 10000,
+                    thin = 10,
+                    control = list(adapt_delta = 0.99, max_treedepth = 20),
+                    backend = 'cmdstanr',
+                    refresh = 0
+                    )
+```
+
+
+```{r}
+owls.brm3 |> 
+  conditional_effects("FoodTreatment:SexParent") |> plot(points = TRUE)
+```
+```{r}
+owls.brm3 |> SUYR_prior_and_posterior()
+```
+
+```{r}
+#pars <- owls.brm3 |> get_variables () |> str_subset("^b_.*|^sd_.*|^sigma*")
+owls.brm3$fit |> stan_trace()
+owls.brm3$fit |> stan_ac()
+owls.brm3$fit |> stan_rhat()
+owls.brm3$fit |> stan_ess()
+```
+
+```{r}
+owls.brm3 |>  pp_check(type = 'dens_overlay', nraws = 100)
+owls.resids <- make_brms_dharma_res(owls.brm3, integerResponse = TRUE)
+testUniformity(owls.resids)
+
+#There might be 0 issues where there are more 0 that Poisson can handle
+owls.resids |> testZeroInflation()
+
+#Model is zero inflated so we will switch to zero inflated model.
+
+# Poisson operates on count process, binomial operates on detection process
+# Hurdle model -> first checks if the conditions met -> ex: you can record 0 calls in a nest that have no chicks, instead of including that as data, Hurdle model excludes it because experiment conditions are not met.
+# If you have too many zero's that are legit -> you run a presence absence model first then for rest of the numbers, run a Poisson.
+```
+
+```{r}
+#| label: Zero-Inflated model
+
+# We are gonna jump to a model of zero inflate Poisson that includes random intercept random slope model which includes this interaction. (FoodTreatment:SexParent|Nest)
+
+owls.form <- bf(NCalls ~ FoodTreatment*SexParent+
+                  offset(log(BroodSize))+
+                  (FoodTreatment*SexParent|Nest), 
+                zi ~ 1,
+                family = zero_inflated_poisson(link = 'log'))
+
+# This model is acknowledging there is zero inflation but its not saying, detection is worse in satiated, deprived or stuff.
+```
+
+```{r}
+get_prior(owls.form, data = owls)
+```
+
+
+
+
+
+where $\boldsymbol{\beta}$ and $\boldsymbol{\gamma}$ are vectors of the fixed
+and random effects parameters respectively and $\bf{X}$ is the model matrix
+representing the overall intercept and effects of food treatment, sex of parent,
+arrival time (and various interactions) on the number of sibling negotiations.
+Brood size was also incorporated as an offset.  $\bf{Z}$ represents a cell means
+model matrix for the random intercepts associated with individual nests.
+
+```{r}
+#| label: Set priors for new model
+
+priors <- prior(normal(0.4,0.7), class = 'Intercept') +
+  prior(normal(0,1.5), class = 'b') +
+  prior(student_t(3,0,0.8), class = 'sd') +
+  prior(lkj_corr_cholesky(1), class = 'cor') +
+  prior(logistic(0,1), class = 'Intercept', dpar='zi')
+```
+
+```{r}
+owls.brm5 <- brm(owls.form,
+                 data = owls,
+                 prior = priors,
+                 sample_prior = 'yes',
+                 iter = 10000,
+                 warmup = 5000,
+                 chains = 3,
+                 cores = 3,
+                 thin = 10,
+                 refresh = 0,
+                 control = list(adapt_delta = 0.99, max_treedepth = 20),
+                 backend = "cmdstanr"
+                 )
+```
+
+```{r}
+owls.brm5 |>  pp_check(type = 'dens_overlay', ndraw = 100)
+owls.resids <- make_brms_dharma_res(owls.brm5, integerResponse = TRUE)
+```
+
+```{r}
+# 20% of zeros are false zeros, they are not expected to be true zeroes. plogis()
+# Odds of zeros being false, 0.26 to 1. exp()
+```
+
+
+
+```{r}
+priors <- prior(normal(0.4,0.7), class = 'Intercept') +
+  prior(normal(0, 1.5), class = 'b') +
+  prior(student_t(3,0,0.7), class = 'sd') +
+  prior(lkj_corr_cholesky(1), class = 'cor') +
+  prior(logistic(0, 1), class = 'Intercept', dpar='zi') +
+  prior(normal(0, 1), class = 'b', dpar = 'zi') +
+  prior(gamma(0.01,0.01), class = 'shape')
+```
+
+
+```{r}
+owls.form1 <- bf(NCalls ~ FoodTreatment*SexParent+
+                  offset(log(BroodSize))+
+                  (FoodTreatment*SexParent|Nest), 
+                zi ~ FoodTreatment*SexParent,
+                family = zero_inflated_negbinomial(link = 'log'))
+```
+
+
+```{r}
+#| label: NegBinomial of the new model with
+owls.brm8 <- brm(owls.form1,
+                 data = owls,
+                 prior = priors,
+                 sample_prior = 'yes',
+                 iter = 10000,
+                 warmup = 5000,
+                 chains = 3,
+                 cores = 3,
+                 thin = 10,
+                 refresh = 0,
+                 control = list(adapt_delta = 0.99, max_treedepth = 20),
+                 backend = "cmdstanr"
+                 )
+```
+
+```{r}
+#Odds zeroes are being false is 0.20 to 1 now after 
+#When they are not hungry, rate
+# Compared to when female returns, when male returns, odds are have false zeroes are 56% less.
+```
+
+
+```{r}
+owls.brm8 |> 
+  emmeans(~FoodTreatment, type = 'response') |>  #type = 'response' to backtransforme it to numbers
+  pairs() # comparison
+```
+
+```{r}
+owls.brm8 |> 
+  emmeans(~FoodTreatment, type = 'link') |>
+  pairs() |> 
+  tidy_draws() |> 
+  exp() |> 
+   summarise_draws(median,
+                  ~HDInterval::hdi(.x),
+                  Pl = ~mean(.x <1),
+                  Pg = ~mean(.x >1)
+                  )
+```
+
+```{r}
+owls.brm8 |> 
+  emmeans(~SexParent, type = 'link') |>
+  pairs() |> 
+  tidy_draws() |> 
+  exp() |> 
+   summarise_draws(median,
+                  ~HDInterval::hdi(.x),
+                  Pl = ~mean(.x <1),
+                  Pg = ~mean(.x >1)
+                  )
+```
+
+
+```{r}
+owlsdata <- owls.brm8 |> 
+  emmeans(~FoodTreatment + SexParent, type = 'response') |>  # we need median and CI and we get them from emmeans, and we want the output to be on response scale.
+  as.data.frame() 
+
+owlsdata |> 
+  ggplot(aes(y = prob, x = FoodTreatment, shape = SexParent)) +
+  geom_pointrange(aes(ymin = lower.HPD, ymax= upper.HPD)) 
+  
+```
+
+# Model validation 
+
+# Model refit and validation 
+
+ 
+# Partial effects plots 
+
+
+# Model investigation 
+
+# Further investigations 
+
+
+# References

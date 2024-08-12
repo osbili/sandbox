@@ -1,0 +1,473 @@
+---
+title: "Bayesian GLMM Part9"
+author: "Murray Logan"
+date: today
+date-format: "DD/MM/YYYY"
+format: 
+  html:
+    ## Format
+    theme: [default, ../resources/ws-style.scss]
+    css: ../resources/ws_style.css
+    html-math-method: mathjax
+    ## Table of contents
+    toc: true
+    toc-float: true
+    ## Numbering
+    number-sections: true
+    number-depth: 3
+    ## Layout
+    page-layout: full
+    fig-caption-location: "bottom"
+    fig-align: "center"
+    fig-width: 4
+    fig-height: 4
+    fig-dpi: 72
+    tbl-cap-location: top
+    ## Code
+    code-fold: false
+    code-tools: true
+    code-summary: "Show the code"
+    code-line-numbers: true
+    code-block-border-left: "#ccc"
+    code-copy: true
+    highlight-style: atom-one
+    ## Execution
+    execute:
+      echo: true
+      cache: true
+    ## Rendering
+    embed-resources: true
+crossref:
+  fig-title: '**Figure**'
+  fig-labels: arabic
+  tbl-title: '**Table**'
+  tbl-labels: arabic
+engine: knitr
+output_dir: "docs"
+documentclass: article
+fontsize: 12pt
+mainfont: Arial
+mathfont: LiberationMono
+monofont: DejaVu Sans Mono
+classoption: a4paper
+bibliography: ../resources/references.bib
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| cache: false
+
+knitr::opts_chunk$set(cache.lazy = FALSE,
+                      tidy = "styler")
+options(tinytex.engine = "xelatex")
+```
+
+
+# Preparations
+
+Load the necessary libraries
+
+```{r}
+#| label: libraries
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false
+
+library(car)       #for regression diagnostics
+library(broom)     #for tidy output
+#library(ggfortify) #for model diagnostics
+library(knitr)     #for kable
+#library(effects)   #for partial effects plots
+library(emmeans)   #for estimating marginal means
+library(MASS)      #for glm.nb
+library(tidyverse) #for data wrangling
+library(brms)
+library(tidybayes)
+library(bayesplot)
+library(broom.mixed)
+library(rstan)
+library(patchwork)
+library(modelsummary)
+library(DHARMa)
+source('helperFunctions.R')
+```
+
+
+
+# Scenario
+
+Once it is established that mass coral bleaching is occurring on the
+Great Barrier Reef (GBR), a monitoring team is mobilised in both the
+air and water in order to document the scale and extent of the
+bleaching. To better understand the causes and consequences of
+bleaching, one marine ecologist (lets call him Terry) was interested
+in investigating differences in bleaching extent across different reef
+habitats. To do so, aerial surveys were partitioned into four habitats
+(C - crest, F - flank, L - lower, U - upper).
+
+Bleaching is scored categorically according to the following scale.
+
+| Bleaching Score | 2016 Equates to  |
+|-----------------+------------------|
+|               0 | No bleaching     |
+|               1 | 0-10% bleaching  |
+|               2 | 10-30% bleaching |
+|               3 | 30-60% bleaching |
+|               4 | > 60% bleaching  |
+
+The GBR is very large and the extent of coral bleaching is not uniform
+throughout the reef. Hence, Terry wanted to see if the habitat
+patterns were similar throughout the GBR or whether they were
+dependent on the overall bleaching severity.
+
+# Read in the data
+
+2016 data only
+
+```{r readData, results='markdown', eval=TRUE}
+hughes = read_csv('../data/hughes.csv', trim_ws=TRUE)
+glimpse(hughes)
+```
+```{r}
+# The response is in cateogical values but we can deal with it in mathematical way so we will act as they are "audited categories". "Cumulative logit" link suits this data? The model assumes there is actually a normal distribution and acts as the distribution is cut into sections. so it is still categories but there is underlying distribution. Latent variable is a variable you dont measure but try to estimate.
+
+#It is gonna try to figure out where the boundaries/thresholds are.
+#How the thresholds differ between different treatments.
+
+# Boundaries act as intercepts so this model has 4 intercepts (exclude the y intercept).
+
+#Whats the effect of this habitat vs that habitat is the question for the model and the thresholds are dividing the effects of habitats on the normal distribution.
+```
+
+```{r}
+# We need to account the dependency of differing reefs within the same land. Some might face more curent. Some might be effected from bleaching. Therefore we are going to add independency variable. 
+
+# Hierarchy Model
+
+# Reef (R) > Sector (R) > Sites (R)
+
+
+# We need to account all as categorical and bleaching effects are ORDERED. meaning 1 comes after 2, 2 comes after 3.
+```
+
+
+| REEF   | HABITAT | SECTOR | SCORE |
+|--------|---------|--------|-------|
+| 09-357 | C       | North  | 4     |
+| 09-357 | F       | North  | 4     |
+| 09-357 | U       | North  | 3     |
+|        |         |        |       |
+
+
+# Data preparation
+
+```{r}
+#|label: Factor the Random Effects
+hughes <- hughes |> 
+  mutate(oSCORE = factor(SCORE, ordered = TRUE),
+         HABITAT = factor(HABITAT),
+         SECTOR = factor(SECTOR, levels = c("North", "Central", "South")),
+         REEF = factor(REEF))
+
+# see the difference of ordered SCORE
+ levels(hughes$SECTOR)
+ levels(hughes$oSCORE)
+```
+
+
+# Exploratory Data Analysis
+
+Proportional (cumulative link) odds-ratio models are useful when the latent
+(unmeasured) response is recorded on a ordinal (ordered categorical) scale.
+When this is the case, we can calculate the probability of a that an observed
+ordinal score ($y$) is less than or equal to any given level ($i$: category) given a set of
+covariates ($\boldsymbol{X}$) according to the following:
+
+$$ Pr(y\le i|\boldsymbol{X}) =
+\frac{1}{1+e^{-(\theta_i - \boldsymbol{\beta}.\boldsymbol{X})}}\\ $$
+
+where $y$ is the observed categorical response, $\boldsymbol{X}$ is a ($n \times
+p$) effects model matrix, $\boldsymbol{\beta}$ are the $p$ effects parameters
+and $\theta_i$ are the $K-1$ category thresholds
+
+
+```{r}
+hughes |> 
+  ggplot(aes(y = oSCORE, x = HABITAT)) +
+  geom_point(position = position_jitter()) +
+  facet_wrap(~SECTOR)
+```
+
+```{r}
+# Habitat C/North has a lot of data collection points, it must be a big site?
+```
+
+
+```{r}
+# We can also use stacked bar graph for better visuals. We need to get count data for that to happen.
+
+hughes |> 
+  group_by(SECTOR, HABITAT, oSCORE) |> 
+  summarise(n = n()) |>
+  ungroup() |> 
+  group_by(SECTOR, HABITAT) |> 
+  mutate(prop = n/sum(n)) |> 
+  mutate(oSCORE = factor(oSCORE, levels = rev(levels(oSCORE)))) ->
+  hughes.sum
+  
+  
+  # -> summarising and creating a column called n to put the data in.
+ # We can take each group(Ex: Nort/C/0) -> divide them by sum of n to get proportion for that specific group
+
+hughes.sum |> 
+  ggplot(aes(y = prop, x = HABITAT)) +
+  geom_bar(stat = 'Identity', aes(fill = oSCORE), color = 'black') +
+  facet_grid(~SECTOR) +
+  scale_fill_manual('Bleaching Score', values = c(heat.colors(5)[-5], '#FFFFFF')) + # FFFFFF is pure white, we replaced a very mild yellow with white
+  scale_y_continuous('Proportion of Reef', expand = c(0,0)) +
+  theme_bw() +
+  theme(panel.spacing.y=unit(10,'pt'))
+  
+```
+
+
+# Fit the model
+
+```{r}
+#|label: Creating the model and formula
+# oSCORE ~ HABITAT*SECTOR + (1|REEF)
+
+hughes.form <- bf(oSCORE ~ HABITAT*SECTOR + (1|REEF),
+                  family = cumulative(link = 'logit', threshold='flexible')
+                  )
+
+#cumulative is our model and threshold = flexible allow the model to set thresholds gives the opportunity to boundaries of different sectors to differ.
+#
+
+get_prior(hughes.form, data = hughes)
+
+# We need to set 4 intercept priors, We are gonna use normal distribution not student_t() and we are gonna set the intercept at one because the program sets too wide of range for priors to make sure and it multiplies the value by 2.5
+
+# We need 11 slopes -> 4 habitats, 3 sectors, = 12 - 1 for discounting global intercept = 11. We used N(0,1) for slopes because we cant deduct a sensible one, and we will start trying.
+
+# We need sigma -> we gonna check VARIABILITY(sigma) across different REEFs.
+
+#b0 = ~N(0,1) intercept
+#b1 = ~N(0,1) b
+#sd = ~N(3,0,1) sd
+
+priors <- prior(normal(0,1), class = "Intercept") +
+  prior(normal(0,1), class = "b") +
+  prior(student_t(3,0,1), class= 'sd') 
+ 
+```
+
+```{r}
+#|label: Running Model
+
+hughes.brm2 <- brm(hughes.form,
+                   data = hughes,
+                   prior = priors,
+                   sample_prior = 'only',
+                   iter = 5000,
+                   warmup = 1000,
+                   chain = 3, cores = 3,
+                   thin = 5,
+                   refresh = 0,
+                   backend = 'cmdstanr'
+                   )
+
+```
+
+
+```{r}
+#| label: Conditional Effects Plot
+
+hughes.brm2 |> 
+  conditional_effects(categorical = TRUE) |> 
+  plot(points = TRUE, ask = FALSE) # even though the points are told to be added, the data is not on the same scale, because the raw data is categorical. the response is categorical.
+```
+
+```{r}
+hughes.brm2 |> 
+  conditional_effects("HABITAT:SECTOR") |> 
+  plot(points = TRUE)
+```
+
+```{r}
+#|label: Run the model with Data and Priors
+
+
+hughes.brm3 <- update(hughes.brm2, sample_prior = 'yes', control = list(adapt_delta = 0.99))
+
+eval: false
+cache: true
+save(hughes.brm3, file = "../data/hughes2.brm3")
+```
+
+```{r}
+load(file = "../data/hughes2.brm3")
+```
+
+
+```{r}
+hughes.brm3 |> 
+  conditional_effects("HABITAT", conditions = make_conditions(hughes.brm3, "SECTOR"), categorical = TRUE
+) 
+```
+
+```{r}
+hughes.brm3 |> 
+  SUYR_prior_and_posterior()
+```
+
+::: {.panel-tabset}
+
+
+:::
+
+# MCMC sampling diagnostics
+
+
+```{r}
+ # we dont need all reef intercepts
+pars <- hughes.brm3 |> get_variables() |> str_subset("^b_.*|^sd_.*")
+
+hughes.brm3$fit |> stan_trace(pars = pars) # set pars so we can have all the interactions and parameters
+hughes.brm3$fit |> stan_ac(pars = pars)
+hughes.brm3$fit |> stan_rhat()
+hughes.brm3$fit |> stan_ess() 
+hughes.brm3 |>  pp_check(type = 'dens_overlay',, ndraws = 100)
+
+hughes.resids <- make_brms_dharma_res(hughes.brm3, integerResponse = FALSE)
+testUniformity(hughes.resids)
+plotResiduals(hughes.resids, quantreg = FALSE)
+plot(hughes.resids, form = factor(rep(1, nrow(hughes))))
+testDispersion(hughes.resids)
+plotResiduals(hughes.resids)
+
+#Ideally the boxs should be remaning within the first and last quantile limits. 
+```
+
+::: {.panel-tabset}
+
+
+:::
+
+# Model validation
+
+```{r}
+#| label: Summarise
+
+# For logit equation (π/(1-π)), you can only do π if you wanna just include intercepts, we have more than just intercepts to look for so we go for (1 -π).
+hughes.brm3 |> 
+  as_draws_df() |> 
+  dplyr::select(matches("^b_.*|^sd_.*")) |> 
+  mutate(across(matches("^b_.*"), exp)) |>  # we only exponentiated the ones starts with b
+   summarise_draws(
+    median,
+    HDInterval::hdi,
+    ess_bulk,
+    ess_tail,
+    Pl = ~mean(.x < 1),
+    Pg = ~mean(.x >1),
+    rhat
+  )
+
+#There is strong evidence for interaction
+
+#HabitatF has 30% lower bleaching probability than C, in North Section.
+#HabitatL has 74% lower bleaching than C, in Northern Section. We have strong evidence for that.
+#HabitatU has 230% more bleaching than C, in Northern Section. It doesn't mean the severity of bleaching is 2.3 times higher, it means the probability of it.
+
+newdata <- with(hughes, expand.grid(
+  HABITAT = levels(HABITAT),
+  SECTOR = levels(SECTOR)
+))
+newdata 
+add_epred_draws(hughes.brm3, newdata = newdata, re_formula = NA) |> 
+  filter(.draw == 1)
+
+# If we filter the results to 1 draw it is not useful at itself, but if we treated as weighted average (meaning the pred X category) we can treat it as weight of that category and create a summ for bleaching severity or effect across sites.
+
+newdata 
+
+
+add_epred_draws(hughes.brm3, newdata = newdata, re_formula = NA) |> 
+  mutate(fit = as.numeric(as.character(.category))*.epred) |> 
+  group_by(HABITAT, SECTOR, .draw) |> 
+    summarise(fit = sum(fit)) |> 
+    summarise_draws(
+      median,
+      HDInterval::hdi
+    ) |> 
+  ggplot(aes(y = median, x = HABITAT)) +
+  geom_hline(yintercept = 1, linetype = 'dashed', size = 0.1) +
+  geom_hline(yintercept = 2, linetype = 'dashed', size = 0.1) +
+  geom_hline(yintercept = 3, linetype = 'dashed', size = 0.1) +
+  geom_pointrange(aes(ymin = lower, ymax = upper)) +
+  facet_grid(~SECTOR) +
+  scale_y_continuous('Bleaching score', breaks = (0:4), labels = 0:4, limits =c(0,4), expand = c(0,0)) +
+  theme_bw() +
+  theme(panel.spacing.y=unit(10,'pt'))
+
+#This shows means that does not compare them.
+
+```
+
+```{r}
+#| label: Mean Comparison of Bleaching for Habitats
+
+
+add_epred_draws(hughes.brm3, newdata = newdata, re_formula = NA) |> #add predictions from data set to the model.
+  mutate(fit = as.numeric(as.character(.category))*.epred) |> # associating the probability and multiply the category with probability so we can eventually sum them up. log needs to be there because it tells us the percentage change of bleaching category.
+  group_by(HABITAT, SECTOR, .draw) |> 
+  summarise(fit = log(sum(fit))) |> 
+  tidybayes::compare_levels(
+    var = fit, by = HABITAT,
+    comparison = emmeans_comparison("revpairwise")
+  ) |> 
+  mutate(fit = exp(fit)) |> # back transforms so the change would be in absolute unit instead of percentage change.
+  group_by(SECTOR, HABITAT) |> 
+    summarise_draws(
+      median,
+      HDInterval::hdi
+    ) |> 
+  ggplot(aes( x = median, y = HABITAT)) +
+  geom_vline(xintercept = 1, linetype = 'dashed') +
+  geom_pointrange(aes(xmin = lower, xmax = upper)) +
+  facet_grid(~SECTOR, scales = 'free') +
+  scale_x_continuous("Effect size (percentage change in bleaching category)",
+      trans = scales::log2_trans()
+  ) +
+  theme_bw()
+```
+
+::: {.panel-tabset}
+
+
+:::
+
+# Model investigation 
+
+::: {.panel-tabset}
+
+
+:::
+
+
+
+
+# Further investigations 
+
+::: {.panel-tabset}
+
+:::
+
+
+
+
+

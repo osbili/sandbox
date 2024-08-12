@@ -1,0 +1,399 @@
+---
+title: "Bayesian GLM Part2"
+author: "Murray Logan"
+date: today
+date-format: "DD/MM/YYYY"
+format: 
+  html:
+    ## Format
+    theme: [default, ../resources/ws-style.scss]
+    css: ../resources/ws_style.css
+    html-math-method: mathjax
+    ## Table of contents
+    toc: true
+    toc-float: true
+    ## Numbering
+    number-sections: true
+    number-depth: 3
+    ## Layout
+    page-layout: full
+    fig-caption-location: "bottom"
+    fig-align: "center"
+    fig-width: 4
+    fig-height: 4
+    fig-dpi: 72
+    tbl-cap-location: top
+    ## Code
+    code-fold: false
+    code-tools: true
+    code-summary: "Show the code"
+    code-line-numbers: true
+    code-block-border-left: "#ccc"
+    code-copy: true
+    highlight-style: atom-one
+    ## Execution
+    execute:
+      echo: true
+      cache: true
+    ## Rendering
+    embed-resources: true
+crossref:
+  fig-title: '**Figure**'
+  fig-labels: arabic
+  tbl-title: '**Table**'
+  tbl-labels: arabic
+engine: knitr
+output_dir: "docs"
+documentclass: article
+fontsize: 12pt
+mainfont: Arial
+mathfont: LiberationMono
+monofont: DejaVu Sans Mono
+classoption: a4paper
+bibliography: ../resources/references.bib
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+knitr::opts_chunk$set(cache.lazy = FALSE,
+                      tidy = "styler")
+options(tinytex.engine = "xelatex")
+```
+
+# Preparations
+
+Load the necessary libraries
+
+```{r}
+#| label: libraries
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false
+
+library(tidyverse)     #for data wrangling etc
+library(rstanarm)      #for fitting models in STAN
+library(cmdstanr)      #for cmdstan
+library(brms)          #for fitting models in STAN
+library(coda)          #for diagnostics
+library(bayesplot)     #for diagnostics
+#library(ggmcmc)        #for MCMC diagnostics
+library(DHARMa)        #for residual diagnostics
+library(rstan)         #for interfacing with STAN
+library(emmeans)       #for marginal means etc
+library(broom)         #for tidying outputs
+library(tidybayes)     #for more tidying outputs
+library(ggeffects)     #for partial plots
+library(broom.mixed)   #for summarising models
+library(ggeffects)     #for partial effects plots
+library(bayestestR)    #for ROPE
+library(see)           #for some plots
+library(easystats)     #for the easystats ecosystem
+#library(INLA)          #for approximate Bayes
+#library(INLAutils)     #for additional INLA outputs
+library(patchwork)     #for multiple plots
+library(modelsummary)  #for data and model summaries 
+theme_set(theme_grey()) #put the default ggplot theme back
+source("helperFunctions.R")
+```
+
+# Scenario
+
+@Polis-1998-490 were interested in modelling the presence/absence of lizards (<i>Uta sp.</i>) against the perimeter to area ratio of 19 islands in the Gulf of California.
+
+![Uta lizard](../resources/uta.jpg){#fig-polis width="200" height="137"}
+
+:::: {.columns}
+
+::: {.column width="50%"}
+
+ISLAND       RATIO   PA
+------------ ------- ----
+Bota         15.41   1
+Cabeza       5.63    1
+Cerraja      25.92   1
+Coronadito   15.17   0
+..           ..      ..
+
+: Format of polis.csv data file {#tbl-polis .table-condensed}
+
+:::
+
+::: {.column width="50%"}
+
+------------ -----------------------------------------------------------------------------------------
+**ISLAND**   Categorical listing of the name of the 19 islands used - variable not used in analysis.
+**RATIO**    Ratio of perimeter to area of the island.
+**PA**       Presence (1) or absence (0) of *Uta* lizards on island.
+------------ -----------------------------------------------------------------------------------------
+
+: Description of the variables in the polis data file {#tbl-polis1 .table-condensed}
+
+:::
+::::
+
+
+The aim of the analysis is to investigate the relationship between island perimeter to area ratio and the presence/absence of Uta lizards.
+
+# Read in the data
+
+```{r}
+#| label: readData
+#| output: true
+#| eval: true
+polis <- read_csv("../data/polis.csv", trim_ws = TRUE)
+```
+
+```{r}
+# Logistic Regression our data indicates. (logit)
+# They are only interested in presence of absence of the Uta lizard, so our data is expected to follow Binomial distribution.
+
+#Priors are -> intercept, slope.
+
+# b0 ~ N(,)
+# b1 ~ N(0,)
+# To make the analysis work better, we need to ensure some overlap on ratio (Ratio of perimeter to area of the island.), because if there is not overlap there is no variance, it is a P or A situation.
+
+ggplot(polis, aes(y = PA, x = RATIO)) +
+  geom_point()
+
+#there is an overlap of data and it is not to a far end.
+```
+
+```{r}
+#| label: Priors
+
+#Priors are quite difficult to come up with for logistic regression. they have to be on the scale of link,
+
+# b0 ~ N(0,1)
+# b1 ~ N(0,1) by default these priors works well for logistic regressions. The problem is they are not deduced by our data at all.
+
+#The wording: When the preliminary ratio is 0 -> presence or absence is 50-50 %. 
+# 1 is quite large for log scale, changing from 0 to 1 is a quite big change for logit scale.
+```
+
+
+# Exploratory data analysis
+
+
+The individual responses ($y_i$, observed presence/absence of Uta
+lizards) are each expected to have been **independently** drawn from
+Bernoulli (or binomial) distributions ($\mathcal{Bin}$). These
+distributions represent all the possible presence/absences we could
+have obtained at the specific ($i^th$) level of island perimeter to
+area ratio.  Hence the $i^th$ presence/absence observation is expected
+to have been drawn from a binomial distribution with a probability of
+$\mu_i$ and size of ($n=1$).
+
+The expected probabilities are related to the linear predictor
+(intercept plus slope associated with perimeter to area ratio) via a
+**logit** link.
+
+We need to supply priors for each of the parameters to be estimated
+($\beta_0$ and $\beta_1$).  Whilst we want these priors to be
+sufficiently vague as to not influence the outcomes of the analysis
+(and thus be equivalent to the frequentist analysis), we do not want
+the priors to be so vague (wide) that they permit the MCMC sampler to
+drift off into parameter space that is both illogical as well as
+numerically awkward.
+
+As a starting point, lets assign the following priors:
+
+- $\beta_0$: Normal prior centred at 0 with a variance of 2.5
+- $\beta_1$: Normal prior centred at 0 with a variance of 1
+
+Note, when fitting models through either `rstanarm` or `brms`, the
+priors assume that the predictor(s) have been centred and are to be
+applied on the link scale.  In this case the link scale is an
+identity.
+
+```{r}
+# They are only interested in presence of absence of the Uta lizard, so our data is expected to follow Binomial distribution.
+
+#Priors are -> intercept, slope.
+
+# b0 ~ N(,)
+# b1 ~ N(0,)
+# To make the analysis work better, we need to ensure some overlap on ratio (Ratio of perimeter to area of the island.), because if there is not overlap there is no variance, it is a P or A situation.
+
+ggplot(polis, aes(y = PA, x = RATIO)) +
+  geom_point()
+
+#there is an overlap of data and it is not to a far end.
+```
+
+Model formula:
+$$
+\begin{align}
+y_i &\sim{} \mathcal{Bin}(n, p_i)\\
+ln\left(\frac{p_i}{1-p_i}\right) &= \beta_0 + \beta_1 x_i\\
+\beta_0 &\sim{} \mathcal{N}(0,2.5)\\
+\beta_1 &\sim{} \mathcal{N}(0,1)\\
+\end{align}
+$$
+```{r}
+#| label: Model Formula
+
+form <- bf(PA | trials(1) ~ RATIO,
+family = binomial(link = "logit")
+)
+
+priors <- prior(normal(0,1), class = "Intercept") +
+  prior(normal(0,1), class = "b")
+polis.brm2 <- brm(form,
+                 data = polis,
+                 prior = priors,
+                 sample_prior = "only",
+                 iter = 5000,
+                 warmup = 1000,
+                 chains = 3, cores = 3,
+                 thin = 5,
+                 refresh = 0,
+                 backend = 'cmdstanr')
+polis.brm2 |>  conditional_effects()
+polis.brm2 |>  conditional_effects() |> plot(points = TRUE)
+polis.brm3 <- polis.brm2 |> update(sample_prior = 'yes', refresh = 0)
+polis.brm3 |> conditional_effects() |>  plot(points = TRUE)
+
+# You can calculate PA from ratio, but you cant go backwards, this prediction model is designed for predicting y from x.
+```
+```{r}
+polis.brm3 |> 
+  conditional_effects() |> 
+  plot(points = TRUE)
+polis.brm3 |>  summary()
+# the transformation function is link and it is on logit scale  -> the formula ( log (π/(1 - π)).
+```
+```{r}
+# We can try to manipulate the formula by have it try to look like 2 ways:
+# 1- π odds ratio
+# π/1-π probability
+
+# for π we have a function to calculate called plogis
+plogis(4.39)
+
+# We check the estimate of intercept and plug it in to find the probability when ratio is 0. 90% chance that they are gonna be there.
+
+# for π/1-π the function is exp.
+exp(4.39) # ~80 meaning their presence is 80 times more likely.
+
+#going for both methods can be done for only INTERCEPT. You have to use odds formula for rest of the points.
+
+# Estimate of Ratio
+exp(-0.25) # -> in every unit of change, the odds of lizards being present, decreases by 23%. Same percentage change indicates exponential decrease in decrease. It is not linear. As the odds decrease, the change in decrease is also changing.
+
+exp(4.45) * exp(-0.26) # ->
+```
+
+
+
+
+# Fit the model 
+ 
+
+# MCMC sampling diagnostics
+
+
+# Partial effects plots 
+
+
+```{r}
+polis.brm3 |>  SUYR_prior_and_posterior()
+polis.brm3$fit |>  stan_rhat()
+polis.brm3$fit |>  stan_ac()
+polis.brm3$fit |>  stan_trace()
+polis.brm3$fit |>  stan_ess()
+polis.brm3 |> pp_check(type = 'dens_overlay', ndraws = 100)
+polis.resids <- make_brms_dharma_res(polis.brm3, integerResponse = FALSE)
+testUniformity(polis.resids)
+```
+
+
+```{r}
+plotResiduals(polis.resids, quantreg = FALSE)
+```
+
+```{r}
+#| label: Check dispersion
+
+#We dont measure variance, we estimate it from π
+testDispersion(polis.resids)
+```
+
+
+# Model validation
+
+
+
+# Model investigation 
+
+```{r}
+polis.brm3 |> 
+  as_draws_df() |> 
+  exp() |> 
+  as.data.frame() |> 
+  dplyr::select(starts_with("b")) |> 
+  summarise_draws(
+  median, 
+  ~HDInterval::hdi(.x), # till is here because when you supply argument (.x), if we don't specify for this case. ~HDInterval::hdi(.x, credMass = 0.92) will decrease the confidence interval to 0.92
+  rhat,
+  ess_bulk,
+  ess_tail,
+  Pl1 = ~mean(.x < 1),
+  Pl0.9 = ~mean(.x <0.9)
+)
+
+# We have strong evidence that odds of lizard being present declines as the preliminary area ratio increases.
+
+#Pl0.9 -> We got strong evidence that the odds of lizard being present, declines by more thatn 10% for every one unit increase in preliminary ratio.
+
+polis.brm3 |> 
+  bayes_R2(summary = FALSE) |>  # we say summary = FALSE -> and wanted to have our median_hdci information, we did not want, rhats, probabilities, means or other stuff. this median_hdci function provides the things we want which are median and hdci
+  median_hdci()
+```
+
+
+# Further analyses 
+
+```{r}
+polis.brm3 |> 
+  as_draws_df() |> 
+  #dplyr::select(starts_with("b_")) |> 
+  mutate(LD50 = -1*b_Intercept/b_RATIO) |> 
+  pull(LD50) |> 
+  median_hdci()
+
+#Ones the island ratio exceeds 17.26 the lizards more likely to disappear than appear (it is threshold of between presence and absence) from the island but the interval of that ratio is within 11.87 - 23.53
+```
+
+# Summary figure 
+
+
+```{r}
+polis.LD50 <-
+polis.brm3 |> 
+  as_draws_df() |> 
+  mutate(LD50 = -1*b_Intercept/b_RATIO) |> 
+  pull(LD50) |> 
+  median_hdci()
+
+polis.data <- with(polis, list(RATIO = seq(min(RATIO), max(RATIO), len =100)))
+polis.brm3 |> 
+  emmeans(~RATIO, at = polis.data, type = 'response') |> 
+  as.data.frame() |> 
+  ggplot(aes(y = prob, x = RATIO)) +
+  geom_point(data = polis, aes(y = PA)) +
+  geom_line() +
+  geom_ribbon(aes(ymin = lower.HPD, ymax = upper.HPD), fill = "blue", alpha = 0.3) +
+  geom_vline(data = polis_LD50, xintercept = polis_LD50$y) +
+  geom_vline(data = polis_LD50, xintercept = polis_LD50$ymin, linetype = 'dashed') +
+  geom_vline(data = polis_LD50, xintercept = polis_LD50$ymax, linetype = 'dashed') +
+  scale_x_continuous("Presence/Absence") +
+  scale_y_continuous("Island Perimeter: AREA")
+```
+
+
+# References

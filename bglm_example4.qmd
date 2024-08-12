@@ -1,0 +1,430 @@
+---
+title: "Bayesian GLM Part4"
+author: "Murray Logan"
+date: today
+date-format: "DD/MM/YYYY"
+format: 
+  html:
+    ## Format
+    theme: [default, ../resources/ws-style.scss]
+    css: ../resources/ws_style.css
+    html-math-method: mathjax
+    ## Table of contents
+    toc: true
+    toc-float: true
+    ## Numbering
+    number-sections: true
+    number-depth: 3
+    ## Layout
+    page-layout: full
+    fig-caption-location: "bottom"
+    fig-align: "center"
+    fig-width: 4
+    fig-height: 4
+    fig-dpi: 72
+    tbl-cap-location: top
+    ## Code
+    code-fold: false
+    code-tools: true
+    code-summary: "Show the code"
+    code-line-numbers: true
+    code-block-border-left: "#ccc"
+    code-copy: true
+    highlight-style: atom-one
+    ## Execution
+    execute:
+      echo: true
+      cache: true
+    ## Rendering
+    embed-resources: true
+crossref:
+  fig-title: '**Figure**'
+  fig-labels: arabic
+  tbl-title: '**Table**'
+  tbl-labels: arabic
+engine: knitr
+output_dir: "docs"
+documentclass: article
+fontsize: 12pt
+mainfont: Arial
+mathfont: LiberationMono
+monofont: DejaVu Sans Mono
+classoption: a4paper
+bibliography: ../resources/references.bib
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+knitr::opts_chunk$set(cache.lazy = FALSE,
+                      tidy = "styler")
+options(tinytex.engine = "xelatex")
+```
+
+# Preparations
+
+Load the necessary libraries
+
+```{r}
+#| label: libraries
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false
+
+library(tidyverse)     #for data wrangling etc
+library(rstanarm)      #for fitting models in STAN
+library(cmdstanr)      #for cmdstan
+library(brms)          #for fitting models in STAN
+library(coda)          #for diagnostics
+library(bayesplot)     #for diagnostics
+library(ggmcmc)        #for MCMC diagnostics
+library(DHARMa)        #for residual diagnostics
+library(rstan)         #for interfacing with STAN
+library(emmeans)       #for marginal means etc
+library(broom)         #for tidying outputs
+library(tidybayes)     #for more tidying outputs
+library(ggeffects)     #for partial plots
+library(broom.mixed)   #for summarising models
+library(ggeffects)     #for partial effects plots
+library(bayestestR)    #for ROPE
+library(see)           #for some plots
+library(easystats)     #for the easystats ecosystem
+library(patchwork)     #for multiple plots
+library(modelsummary)  #for data and model summaries 
+library(car)           #for scatterplot matrices
+library(ggridges)      #for ridge plots 
+theme_set(theme_grey()) #put the default ggplot theme back
+source("helperFunctions.R")
+```
+
+# Scenario
+ 
+@Loyn-1987-1987 modelled the abundance of forest birds with six predictor
+variables (patch area, distance to nearest patch, distance to nearest
+larger patch, grazing intensity, altitude and years since the patch had
+been isolated).
+
+![Regent honeyeater](../resources/regent_honeyeater_small.jpg){#fig-honeyeater width="165" height="240"}
+
+
+ABUND   DIST   LDIST   AREA   GRAZE   ALT   YR.ISOL
+------- ------ ------- ------ ------- ----- ---------
+..      ..     ..      ..     ..      ..    ..
+
+: Format of loyn.csv data file {#tbl-loyn .table-condensed}
+
+------------- ------------------------------------------------------------------------------
+**ABUND**     Abundance of forest birds in patch- response variable
+**DIST**      Distance to nearest patch - predictor variable
+**LDIST**     Distance to nearest larger patch - predictor variable
+**AREA**      Size of the patch - predictor variable
+**GRAZE**     Grazing intensity (1 to 5, representing light to heavy) - predictor variable
+**ALT**       Altitude - predictor variable
+**YR.ISOL**   Number of years since the patch was isolated - predictor variable
+------------- ------------------------------------------------------------------------------
+
+```{r}
+# We are not trying to do prediction. We are trying to see what impact does this 6 parameters have in driving bird abundance patterns.
+```
+
+
+: Description of the variables in the loyn data file {#tbl-loyn1 .table-condensed}
+
+The aim of the analysis is to investigate the effects of a range of
+predictors on the abundance of forest birds.
+
+# Read in the data
+
+```{r}
+# We are dealing with bird count so we are going to be implementing Poisson. However, they have different amount of quadrants for each area they measured, depending on the size of the area, so they AVERAGED the quadrant data in a patch of area. Poisson likes to deal with raw data, now aggregated data is not integer which disrupts the concept of count. It is not proportions so its not Binomial, We can do Gaussian, we might entertain Gamma distribution, we could do a t distribution, we can also try a log normal distribution. 
+
+#Authors of this data did square-root transformation. Which is very dangerous thing, because you cannot back transform, (negatives are back transformed as positives, decimals are back transformed as less than their original value (0.5 -> 0.25). We rather to find a distribution to match the data, then transforming the data to match a certain distribution.
+```
+
+```{r}
+# The predictors are continuous, so we have to center them. Because y-intercept when all the predictors (distance,altitude, etc = 0) does not make sense. How is distance of a quadrant is 0 to another quadrant. So centering them is necessary, and we will be scaling them which provides an advantage. It puts each predictors on same scale so we can determine which has biggest impact by comparing their slopes, they become comparible. It is important that predictors are not correlated, they will compete in the model which will cause grossly/under estimate the effect of one of them. Estimates will be wildly out.
+```
+
+```{r}
+# Predictors should be symmetrical, ideally they should be uniformed. They need to be symmetrical uniform or normal.
+# We also assume that trends are linear.
+# We need to make sure data is equally varied (homogeniety of variance).
+# We need to make sure the predictions are not correlated with one another.
+```
+
+
+```{r readData, results='markdown', eval=TRUE}
+loyn <- read_csv('../data/loyn.csv', trim_ws=TRUE)
+```
+
+
+
+# Exploratory data analysis
+
+Model formula:
+$$
+y_i \sim{} \mathcal{N}(\mu_i, \sigma^2)\\
+log(\mu_i) = \boldsymbol{\beta} \bf{X_i}\\
+\beta_0 \sim{} \mathcal{N}(3,0.5)\\
+\beta_{1-9} \sim{} \mathcal{N}(0,2.5)\\
+\sigma \sim{} \mathcal{Gamma}(2,1)\\
+OR\\
+\sigma \sim{} \mathcal{t}(3,0,2.5)
+$$
+
+where $\boldsymbol{\beta}$ is a vector of effects parameters and $\bf{X}$ is a model matrix representing the additive effects of
+the scaled versions of distance (ln), distance to the nearest large patch (ln), patch area (ln), grazing intensity, year of isolation and 
+altitude on the abundance of forest birds.
+
+
+```{r}
+#| label: Scatterplot Matrix
+
+library(car)
+
+scatterplotMatrix(~ABUND+DIST+LDIST+AREA+GRAZE+ALT+YR.ISOL, data =loyn,
+                  diagonal = list(method = 'boxplot'))
+
+#Boxplots will help us assess normality. Diagonal
+#Top line shows response of the abundance to each predictors. It is assesing linearity and homogeneity.
+#All others will for assessing correlations between predictors.
+
+# If the data is not normally distributed, if the normality is not there, it is difficult to assess others (linearity, homogeneity)
+
+```
+
+```{r}
+#| label: Log Transform
+#Log transformation will provide normality for predictors since abundance is skewed for bunch of predictors. We are only log transform the skewed ones. (Log transformation has bigger impact on smaller numbers so it will stretch the boxplot to the middle)
+
+scatterplotMatrix(~ABUND+log(DIST)+log(LDIST)+log(AREA)+GRAZE+ALT+YR.ISOL, data =loyn,
+                  diagonal = list(method = 'boxplot'))
+# grazing was categorical, we shouldn't treat it as continuous anymore.
+# variance looks okay, there is no drastic change within variables of each group. homogeneity looks alright.
+#DIST and LDIST looks correlated which makes sense because they show strong relationship, in our model we should keep them separate. We can either take one of them out, both of them out, leave both in.
+```
+
+```{r}
+#| label: Checking variance inflation
+
+vif(lm(ABUND ~ log(DIST) + log(LDIST) + log(AREA) + GRAZE + YR.ISOL + ALT, data = loyn))
+
+#Numbers in results are called variance inflation factors. Equivalent of 1 on, meaning 1/vif. 60% indicates correlation. Above 80% indicates strong correlation. Values above 3 in the table indicates it is correlated to the rest of the pool and will compete. They shouldn't be in the same model. Our results indicate we can leave all the predictors in the model.
+```
+
+```{r}
+#GRAZE is the first group for categorical values. Before grazing is all
+loyn <- loyn |>  mutate(fGRAZE = factor(GRAZE))
+
+#Although the boxplot for ABUND looks normal enough, when Gaussian distribution was implemented, it shows that for very small areas predictors indicated negative amount of birds which is non-sense. That is why we do log normal distribution. If the abundance was high enough, Gaussian would be okay.
+```
+
+```{r}
+#| label: Priors
+
+#Start by getting average number of birds for grazing areas. We particularly want median and mad for grazing area 1 because that is our starting point.
+
+loyn |> group_by(fGRAZE) |> 
+  summarise(Median = median(log(ABUND)),
+            MAD = mad(log(ABUND)))
+
+# Our priors: mean would be 3.4, variance would be ~0.1
+# For scaled predictors a prior of (0,1) should be 1. But we have a categorical predictor so it might be wide enough to cover 2 instead of 1. We have to try and see.
+
+# b0 ~ N(3.4, 0.1)
+# b1 ~ N(0,2)
+# sigma ~ N(3,0,1) -> that value is always 3, we for t distribution(necessary for sigma), We have now priors for intercept (b0), prior for slope(b1) and prior for sigma(3,0,1) now we can code.
+
+priors <- prior(normal(3.4,0.1), class = 'Intercept') +
+prior(normal(0,2), class = 'b') +
+prior(student_t(3,0,1), class = 'sigma')
+# you can log scale data, but you cant scale log data.
+```
+
+
+# Fit the model 
+
+```{r}
+loyn.form <- bf(ABUND ~ scale(log(DIST))+
+                  scale(log(LDIST))+
+                  scale(log(AREA)) +
+                  fGRAZE +
+                  scale(ALT) +
+                  scale(YR.ISOL),
+                  family = gaussian(link = 'log'))
+loyn.brm2 <- brm(loyn.form,
+                 data = loyn,
+                 prior = priors,
+                 sample_prior = 'only',
+                 iter = 5000,
+                 warmup = 1000,
+                 chains = 3, cores = 3,
+                 thin = 5,
+                 refresh = 0,
+                 backend = "cmdstanr")
+```
+
+
+# MCMC sampling diagnostics
+
+# Model validation 
+
+
+
+# Partial effects plots 
+
+```{r}
+loyn.brm2 |> 
+  conditional_effects() |> 
+  plot(points = TRUE, ask = FALSE, plot = FALSE) |> 
+  wrap_plots() & # -> & sign is for if you want to apply changes on the plots (changing y axis scale to log) you use & sign to apply the changes to all of them.
+  scale_y_log10()
+```
+```{r}
+loyn.brm3 <- update(loyn.brm2, sample_prior = 'yes', refresh = 0)
+loyn.brm3 |> 
+ conditional_effects() |> 
+  plot(points = TRUE, ask = FALSE, plot = FALSE) |> 
+  wrap_plots() & 
+  scale_y_log10()
+
+loyn.brm3 |> SUYR_prior_and_posterior() 
+
+loyn.brm3 |> conditional_effects(effects = "AREA") |> plot(points = TRUE) |> _[[1]] + scale_y_log10()
+```
+
+
+# Model investigation 
+
+```{r}
+loyn.brm3$fit |> stan_trace() #pars not specified can be removed by specifying
+loyn.brm3$fit |> stan_trace(pars = "sigma")
+loyn.brm3$fit |> get_variables() 
+loyn.brm3$fit |> get_variables() |> str_subset(pattern = '^b_.*') # dot means any character before me, star means any number of the thing before me, this means that they are looking for anything that starts with b_ and comes anything else afterwards. ^ means letter b must be at the start it wont search a string that has b in the middle. if ^ replaced with $ it means ends with. so if you write b_.*^sigma$ it means look for sigma and sigma only no addition afterwards.
+
+```
+
+
+# Further analyses 
+
+```{r}
+loyn.brm3$fit |> get_variables() |> str_subset(pattern = '^b_.*|^sigma$') -> par
+
+par
+
+loyn.brm3$fit |> stan_ac(pars = par)
+loyn.brm3$fit |> stan_rhat()
+loyn.brm3$fit |> stan_ess()
+
+
+loyn.brm3 |>  pp_check(type = 'dens_overlay', ndraws = 100)
+
+# Checking for residuals
+loyn.resids <- make_brms_dharma_res(loyn.brm3, integerResponse = FALSE)
+testUniformity(loyn.resids)
+
+plotResiduals(loyn.resids)
+
+plot(as.vector(loyn.resids$scaledResiduals) ~ log(loyn$AREA)) # just plotting residuals against AREA
+plot(as.vector(loyn.resids$scaledResiduals) ~ log(loyn$DIST))
+plot(as.vector(loyn.resids$scaledResiduals) ~ log(loyn$LDIST))
+plot(as.vector(loyn.resids$scaledResiduals) ~ loyn$YR.ISOL)
+plot(as.vector(loyn.resids$scaledResiduals) ~ loyn$ALT)
+plot(as.vector(loyn.resids$scaledResiduals) ~ log(loyn$GRAZE))
+
+testDispersion(loyn.resids) # we didnt need to check dispersion because we already modelled it.
+```
+
+
+```{r}
+loyn.brm3 |> 
+  as_draws_df() |> 
+  dplyr::select(matches("b_.*|^sigma$")) |> 
+  exp() |> 
+  summarise_draws(
+    median,
+    HDInterval::hdi,
+    rhat,
+    ess_bulk,
+    ess_tail
+  )
+
+# its exponentiated so the values are averages, ~23 birds for Grazing level1 (Intercept).
+# b values are called partial slopes because when you are looking at an effect of one parameter, the others are hold as constant.
+
+#scaledist median -> for every one unit change in distance, it shows the change of effect on response, because we have exponentiated, the numbers are multiplies. Also the lower and upper range includes 1 in the middle so it can be effecting positive or negative meaning no evidence.
+# Scaling also help to assess which predictor has the biggest impact. You need to check the table. 
+#1/0.4623 = 2.163098 grazing has the biggest impact ( we do inverse because it is a negative effect)
+```
+
+```{r}
+loyn.brm4a <- update(loyn.brm3, .~scale(log(DIST))*scale(log(LDIST)),
+                     save_pars = save_pars(all = TRUE), refresh = 0)
+loyn.brm4b <- update(loyn.brm3, .~scale(log(AREA))*fGRAZE,
+                     save_pars = save_pars(all = TRUE), refresh = 0)
+loyn.brm4c <- update(loyn.brm3, .~scale(log(AREA))*scale(YR.ISOL)*fGRAZE,
+                     save_pars = save_pars(all = TRUE), refresh = 0)
+loyn.brm4d <- update(loyn.brm3, .~scale(log(DIST))*scale(ALT),
+                     save_pars = save_pars(all = TRUE), refresh = 0)
+loyn.brm4e <- update(loyn.brm3, .~1,         # 1 stands for intercept -> NULL model good for comparison
+                     save_pars = save_pars(all = TRUE), refresh = 0)
+
+#you take the deviants (unexplained parts) multiply by 2 and penalise it for number of criterias, its called information criteria -> information criteria lower is better, it implies less unexplained models.
+
+# We are gonna use LOO information criteria (Leave One Out) -> you create a model with leaving 1 observation out and check how model predicts without that observation.
+
+loo(loyn.brm4a) # -217.2 -> * -2 = 434.3 (looic in table) -> information criteria, by itself means nothing at all.
+loo(loyn.brm4e) # p_loo is for number of parameters -> null model has 1.2 whereas model a had ~4, so model a is not a good model
+loo(loyn.brm4b) # lower information criteria than null model.
+
+loo_compare(loo(loyn.brm4a), loo(loyn.brm4e))
+
+loo_compare(loo(loyn.brm4b), loo(loyn.brm4e)) #it ranks them from top to bottom
+
+```
+
+```{r}
+loyn.brm4b |> conditional_effects(effects = "AREA:fGRAZE") |>  plot() |>  _[[1]] + 
+  scale_y_log10() +
+  scale_x_log10()
+```
+
+
+
+
+```{r}
+loyn.brm4b |> 
+  as_draws_df() |> 
+  dplyr::select(matches("b_.*|^sigma$")) |> 
+  exp() |> 
+  summarise_draws(
+    median,
+    HDInterval::hdi,
+    rhat,
+    Pl1 = ~mean(.x<1),
+    Pg1 = ~mean(.x>1)
+  )
+
+# It is important to look at the interactions first.
+# The magnitude of effect of area depends on grazing.
+# The magnitude of effect of grazing depends on area.
+```
+
+```{r}
+loyn.list <- with(loyn, list(AREA = c(min(AREA), median(AREA), max(AREA))))
+loyn.list
+
+loyn.brm4b |> 
+  emmeans(~fGRAZE|AREA, at = loyn.list, type = "response") |> 
+  pairs()
+
+# In small areas, drastic grazing does have little effect 
+```
+
+# Summary figure
+
+
+# References

@@ -1,0 +1,454 @@
+---
+title: "Bayesian GLM Part6"
+author: "Murray Logan"
+date: today
+date-format: "DD/MM/YYYY"
+format: 
+  html:
+    ## Format
+    theme: [default, ../resources/ws-style.scss]
+    css: ../resources/ws_style.css
+    html-math-method: mathjax
+    ## Table of contents
+    toc: true
+    toc-float: true
+    ## Numbering
+    number-sections: true
+    number-depth: 3
+    ## Layout
+    page-layout: full
+    fig-caption-location: "bottom"
+    fig-align: "center"
+    fig-width: 4
+    fig-height: 4
+    fig-dpi: 72
+    tbl-cap-location: top
+    ## Code
+    code-fold: false
+    code-tools: true
+    code-summary: "Show the code"
+    code-line-numbers: true
+    code-block-border-left: "#ccc"
+    code-copy: true
+    highlight-style: atom-one
+    ## Execution
+    execute:
+      echo: true
+      cache: true
+    ## Rendering
+    embed-resources: true
+crossref:
+  fig-title: '**Figure**'
+  fig-labels: arabic
+  tbl-title: '**Table**'
+  tbl-labels: arabic
+engine: knitr
+output_dir: "docs"
+documentclass: article
+fontsize: 12pt
+mainfont: Arial
+mathfont: LiberationMono
+monofont: DejaVu Sans Mono
+classoption: a4paper
+bibliography: ../resources/references.bib
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+knitr::opts_chunk$set(cache.lazy = FALSE,
+                      tidy = "styler")
+options(tinytex.engine = "xelatex")
+```
+
+# Preparations
+
+Load the necessary libraries
+
+```{r}
+#| label: libraries
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false
+
+library(tidyverse)     #for data wrangling etc
+library(rstanarm)      #for fitting models in STAN
+library(cmdstanr)      #for cmdstan
+library(brms)          #for fitting models in STAN
+library(standist)      #for exploring distributions
+library(HDInterval)    #for HPD intervals
+library(posterior)     #for posterior draws
+library(coda)          #for diagnostics
+library(bayesplot)     #for diagnostics
+library(ggmcmc)        #for MCMC diagnostics
+library(DHARMa)        #for residual diagnostics
+library(rstan)         #for interfacing with STAN
+library(emmeans)       #for marginal means etc
+library(broom)         #for tidying outputs
+library(tidybayes)     #for more tidying outputs
+library(ggeffects)     #for partial plots
+library(broom.mixed)   #for summarising models
+library(ggeffects)     #for partial effects plots
+library(bayestestR)    #for ROPE
+library(see)           #for some plots
+library(easystats)     #for the easystats ecosystem
+library(ggridges)      #for ridge plots
+library(patchwork)     #for multiple plots
+library(modelsummary)  #for data and model summaries 
+theme_set(theme_grey()) #put the default ggplot theme back
+source("helperFunctions.R")
+```
+
+# Scenario
+
+An ecologist studying a rocky shore at Phillip Island, in southeastern Australia, was interested in how
+clumps of intertidal mussels are maintained [@Quinn-1988-137]. In particular, he wanted to know how densities of adult
+mussels affected recruitment of young individuals from the plankton. As with most marine invertebrates,
+recruitment is highly patchy in time, so he expected to find seasonal variation, and the interaction
+between season and density - whether effects of adult mussel density vary across seasons - was the aspect
+of most interest.
+
+The data were collected from four seasons, and with two densities of adult mussels. The experiment
+consisted of clumps of adult mussels attached to the rocks. These clumps were then brought back to the
+laboratory, and the number of baby mussels recorded. There were 3-6 replicate clumps for each density
+and season combination.
+
+SEASON   DENSITY   RECRUITS   SQRTRECRUITS   GROUP
+-------- --------- ---------- -------------- ------------
+Spring   Low       15         3.87           SpringLow
+..       ..        ..         ..             ..
+Spring   High      11         3.32           SpringHigh
+..       ..        ..         ..             ..
+Summer   Low       21         4.58           SummerLow
+..       ..        ..         ..             ..
+Summer   High      34         5.83           SummerHigh
+..       ..        ..         ..             ..
+Autumn   Low       14         3.74           AutumnLow
+..       ..        ..         ..             ..
+
+: Format of the quinn.csv data file {#tbl-quinn .table-condensed}
+
+------------------ --------------------------------------------------------------------------------------------
+**SEASON**         Categorical listing of Season in which mussel clumps were collected ­ independent variable
+**DENSITY**        Categorical listing of the density of mussels within mussel clump ­ independent variable
+**RECRUITS**       The number of mussel recruits ­ response variable
+**SQRTRECRUITS**   Square root transformation of RECRUITS - needed to meet the test assumptions
+**GROUPS**         Categorical listing of Season/Density combinations - used for checking ANOVA assumptions
+------------------ --------------------------------------------------------------------------------------------
+
+: Description of the variables in the quinn data file {#tbl-quinn1 .table-condensed}
+
+![Mussel](../resources/mussels.jpg){#fig-mussel height="300"}
+
+```{r}
+# Data is count data so we will do Poisson, categorical variables (density -> high/low, seasons). We will re-order the seasons because R will automatically order them in alphabetical
+```
+ 
+# Read in the data
+
+```{r}
+quinn <- read_csv("../data/quinn.csv", trim_ws = TRUE)
+```
+
+
+
+# Exploratory data analysis
+
+Model formula:
+$$
+\begin{align}
+y_i &\sim{} \mathcal{NB}(\lambda_i, \theta)\\
+ln(\mu_i) &= \beta_0 + \sum_{j=1}^nT_{[i],j}.\beta_j\\
+\beta_0 &\sim{} \mathcal{N}(2.4, 1.5)\\
+\beta_{[1,2,3]} &\sim{} \mathcal{N}(0, 1)\\
+\end{align}
+$$
+
+where $\beta_{0}$ is the y-intercept (mean of the first group),
+$\beta_{[1,2,3]}$ are the vector of effects parameters (contrasting
+each group mean to that of the first group and $T{[i],j}$ represents a
+$i$ by $j$ model matrix is a model matrix representing the season,
+density and their interaction on mussel recruitment.
+
+```{r dataprep, results='markdown', eval=TRUE}
+quinn <- quinn |>
+  mutate(SEASON = factor(SEASON,
+                         levels = c("Spring", "Summer", "Autumn", "Winter")),
+                         DENSITY = factor(DENSITY))
+quinn |> 
+  ggplot(aes(y = RECRUITS, x = SEASON, fill = DENSITY)) +
+  geom_boxplot()
+
+# mean and variance are clearly related. (box is centered across the line(in the middle))
+```
+# Exploratory data analysis
+
+```{r}
+#| label: Priors
+# There are 8 combinations within season and density, we should allocate the highest sample size to be the intercept.
+
+quinn |> group_by(SEASON, DENSITY) |> count()
+
+b0 ~ N( , )
+b1 ~N(0 , )
+
+quinn |> group_by(SEASON, DENSITY) |> summarise(Median = median(log(RECRUITS)), MAD = mad(log(RECRUITS))
+) #log transformation gave us -inf as result which is due to 0's being log. we need to add at least 0.1 to the values so that they will be logged and remain low. lower number than that 
+
+priors <- prior(normal(2.4, 0.2), class = "Intercept") +
+  prior(normal(0,1), class = "b") 
+```
+
+
+
+
+# Fit the model 
+```{r}
+#| label: Creating formula
+
+quinn.form <- bf(RECRUITS ~ SEASON*DENSITY, family = poisson(link = 'log'))
+quinn.brm2 <- brm(quinn.form,
+                 data = quinn,
+                 prior = priors,
+                 sample_prior = 'only',
+                 iter = 5000,
+                 warmup = 1000,
+                 chains = 3, cores = 3,
+                 thin = 5,
+                 refresh = 0,
+                 backend = "cmdstanr")
+```
+
+```{r}
+#| label: Conditional Effects Plot
+quinn.brm2 |> 
+  conditional_effects('SEASON:DENSITY') |> 
+  plot(points = TRUE)
+```
+
+```{r}
+quinn.brmP <- quinn.brm2 |> update(sample_prior = 'yes', refresh = 0)
+quinn.brmP |> 
+  conditional_effects('SEASON:DENSITY') |> 
+  plot(points = TRUE)
+# Data is not driven by priors which is good.
+
+quinn.brmP |> SUYR_prior_and_posterior()
+```
+
+```{r}
+quinn.brmP$fit |> stan_trace() #pars not specified can be removed by specifying
+quinn.brmP$fit |> stan_ac()
+quinn.brmP$fit |> stan_rhat()
+quinn.brmP$fit |> stan_ess() # some over and under estimations are happening
+quinn.brmP$fit |> get_variables() 
+quinn.brmP$fit |> get_variables() |> str_subset(pattern = '^b_.*|^Intercept$')
+
+```
+
+```{r}
+#| label: DHARMa
+
+quinn.resids <- make_brms_dharma_res(quinn.brmP, integerResponse = FALSE)
+testUniformity(quinn.resids)
+testDispersion(quinn.resids) #dispersion is 2.6, the assumption is 1 so it is over-dispersed, we are over confident. unjustifyably confident, we can't ignore this, we have to deal with it. there might be other drivers rather than season and density, lots of other things that can cause the data to vary in real life. Lots of unmeasured things could cause more variance. You could add more variables if you have more data. Ex: tidal mark where muscles sat at. Can we put a proxy for all unmeasured things? Yes. It is called adding a unit level random effect. One problem it can cause, statistical shrinkage, it is where means are drawn in to be similar caused by the unit level random effect addition.
+
+#Another technic is using negative binomial instead of Poisson. It is a catchold for a lot of causes of overdispersion. It has a dispersion parameter to estimate instead of assume it is 1. It will prevent over-dispersion.
+
+# Excessive 0's can also cause over-dispersion.
+
+# For our case there were couple of 0's so the overdispersion was mostly caused by variance being higher than it should be (for Poisson it is equal to µ)
+
+# We are going to be swapping Poisson with Negative Binomial. We need to come up with a new prior which will be dispersion prior (µ/variance) -> gamma( 0.01, 0.01) -> gamma( shape1, shape2) -> numbers are default for gamma and the parameters of it called shape1, shape2 you can increase the numbers if the data is very very overdispersed
+```
+
+
+
+
+# MCMC sampling diagnostics
+
+
+# Model validation 
+
+
+# Explore negative binomial model
+
+```{r}
+#| label: Fit new model
+
+quinn.brmsNB <- brm(quinn.form,
+                   data = quinn,
+                   prior = priors,
+                   refresh = 0,
+                   chains = 3, cores = 3,
+                   iter = 5000,
+                   thin = 5,
+                   warmup = 1000,
+                   backend = 'cmdstanr')
+
+```
+
+```{r}
+#| label: Checking the model
+
+# To save time we are gonna straight do DHARMa residuals, the prior checks were okay.
+
+quinn.resids <- make_brms_dharma_res(quinn.brmsNB, integerResponse = TRUE)
+testUniformity(quinn.resids)
+testDispersion(quinn.resids)
+```
+
+```{r}
+#| label: Add gamma to the priors.
+
+priors <- prior(normal(2.4, 0.2), class = "Intercept") +
+  prior(normal(0,1), class = "b") +
+  prior(gamma(0.01,0.01), class = "shape")
+
+# We also need to alter the formula.
+
+quinn.form <- bf(RECRUITS ~ SEASON*DENSITY, family = negbinomial(link = 'log')) 
+
+#This is how to get an idea of which priors you need to include to your formula -> default priors on the list is too wide.
+get_prior(quinn.form, data = quinn)
+quinn.brmsNB <- brm(quinn.form,
+                   data = quinn,
+                   prior = priors,
+                   refresh = 0,
+                   chains = 3, cores = 3,
+                   iter = 5000,
+                   thin = 5,
+                   warmup = 1000,
+                   backend = 'cmdstanr')
+```
+
+
+# Partial effects plots 
+
+```{r}
+quinn.brmsNB |> conditional_effects("SEASON:DENSITY") |> plot(points = TRUE)
+```
+
+
+
+# Model investigation 
+
+```{r}
+#| label: Summary
+
+quinn.brmsNB |> 
+  as_draws_df() |> 
+  dplyr::select(matches("^b_.*|^shape")) |> 
+  exp() |> 
+  summarise_draws(
+    median,
+    HDInterval::hdi,
+    rhat,
+    length,
+    ess_bulk,
+    ess_tail
+  )
+
+# FOR HIGH DENSITY AREAS ONLY
+
+# For the recruitment numbers it is 4.57 times higher or 357% more in Summer than Spring for High density areas that measurements occurred. We have strong evidence in increase in recruitment between Spring and Summer.
+
+# 86% increase in recruitment between Spring and Autumn. We have strong evidence on increase in recruitment between Spring and Autumn.
+
+# Recruitment in winter halved between Summer and Winter. Decreased 48%. We have strong evidence on the decrease.
+
+# FOR LOW and HIGH DENSITY AREAS
+
+# No evidence in Spring 
+
+# The decrease (~56%) on Spring to Summer compared to High density Spring to Summer, Low density Spring to Summer has done 56% recruitment less than we expected from low density Spring to Summer. We can say that there is evidence of interaction between Spring and Summer. We have strong evidence.
+
+# The Spring to Autumn suggests no evidence.
+
+# The Spring to Winter suggests no interaction and provides similar decrease in Recruitment compared to High density Spring to Winter recruitment. There is strong evidence that supports.
+```
+
+```{r}
+quinn.brmsNB |> 
+  as_draws_df() |> 
+  dplyr::select(matches("^b_.*|^shape$")) |> 
+  mutate(across(-shape, exp)) |> 
+  summarise_draws(
+    median,
+    HDInterval::hdi,
+    rhat,
+    length,
+    ess_bulk, ess_tail
+  )
+```
+
+
+# Further investigations 
+
+```{r}
+quinn.brmsNB |> 
+  emmeans(~DENSITY|SEASON, type = 'response') |>
+  pairs()
+
+# Strong evidence for Summer that density is a driver for high recruitment change
+# In sufficient evidence for Autumn.
+# In sufficient evidence for Winter.
+```
+
+
+```{r}
+#|label: Seasons effect on recruitment in different densities
+quinn.brmsNB |> 
+  emmeans(~DENSITY | SEASON, type = 'link') |> 
+  pairs() |> 
+  gather_emmeans_draws() |> 
+  mutate(Fit = exp(.value)) |> 
+  dplyr::select(-.chain,-.value) |> 
+  summarise_draws(
+    median,
+    HDInterval::hdi,
+    Pg1 = ~mean(.x > 1),
+    Pg20 = ~mean(.x > 1.2)
+  )
+  # When you use gather_emmeans the columns that use dots are called dot values.
+
+# We conclude there is density influence in Spring/Summer as strong evidence
+# There is EVIDENCE (not strong (checkLPg1)) that density influence recruitment for Spring/Winter recruitment (92%)
+
+```
+
+```{r}
+#| label: Different density's effect on recruitment in different seasons
+quinn.brmsNB |> 
+  emmeans(~SEASON | DENSITY, type = 'link') |> 
+  pairs() |> 
+  gather_emmeans_draws() |> 
+  mutate(Fit = exp(.value)) |> 
+  dplyr::select(-.chain,-.value) |> 
+  summarise_draws(
+    median,
+    HDInterval::hdi,
+    Pg1 = ~mean(.x > 1),
+    Pg20 = ~mean(.x > 1.2)
+  )
+```
+
+```{r}
+quinn.brmsNB |>  
+  emmeans(~DENSITY | SEASON, type ='link') |> 
+  regrid() |> # back transforms before the pairs -> we get absolute change
+  pairs() # if it was just this it does not back transforms 
+
+#Now we get actual numbers -> ~23 more individuals in Summer.
+# We get ~2.6 individuals between Spring - Winter -> number was low to begin with. Since this is on absolute scale you are looking for 0 now for evidence not 1.
+```
+
+
+# Summary figures 
+
+
+
+# References
